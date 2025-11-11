@@ -31,4 +31,4 @@ jobs:
         push: true # 推送镜像
         tags: |
           ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAME_SPACE }}/vaultwarden:latest
-          ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAME_SPACE }}/vaultwarden:1.34.1
+          ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAME_SPACE }}/vaultwarden:1.34.3
