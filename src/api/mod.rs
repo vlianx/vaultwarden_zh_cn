@@ -36,9 +36,10 @@ use crate::db::{
     models::{OrgPolicy, OrgPolicyType, User},
     DbConn,
 };
+use crate::CONFIG;
 
 // Type aliases for API methods results
-type ApiResult<T> = Result<T, crate::error::Error>;
+pub type ApiResult<T> = Result<T, crate::error::Error>;
 pub type JsonResult = ApiResult<Json<Value>>;
 pub type EmptyResult = ApiResult<()>;
 
@@ -54,7 +55,7 @@ impl PasswordOrOtpData {
     /// Tokens used via this struct can be used multiple times during the process
     /// First for the validation to continue, after that to enable or validate the following actions
     /// This is different per caller, so it can be adjusted to delete the token or not
-    pub async fn validate(&self, user: &User, delete_if_valid: bool, conn: &mut DbConn) -> EmptyResult {
+    pub async fn validate(&self, user: &User, delete_if_valid: bool, conn: &DbConn) -> EmptyResult {
         use crate::api::core::two_factor::protected_actions::validate_protected_action_otp;
 
         match (self.master_password_hash.as_deref(), self.otp.as_deref()) {
@@ -109,6 +110,8 @@ async fn master_password_policy(user: &User, conn: &DbConn) -> Value {
                 enforce_on_login: acc.enforce_on_login || policy.enforce_on_login,
             }
         }))
+    } else if CONFIG.sso_enabled() {
+        CONFIG.sso_master_password_policy_value().unwrap_or(json!({}))
     } else {
         json!({})
     };

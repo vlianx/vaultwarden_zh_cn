@@ -19,24 +19,24 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull docker.io/vaultwarden/web-vault:v2025.6.0
-#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2025.6.0
-#     [docker.io/vaultwarden/web-vault@sha256:494be10bd99d9d05c7bec13dad71ad99102ea920de9a5d3587529709a64fb42c]
+#     $ docker pull docker.io/vaultwarden/web-vault:v2025.10.1
+#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2025.10.1
+#     [docker.io/vaultwarden/web-vault@sha256:50662dccf4908ac2128cd44981c52fcb4e3e8dd56f21823c8d5e91267ff741fa]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:494be10bd99d9d05c7bec13dad71ad99102ea920de9a5d3587529709a64fb42c
-#     [docker.io/vaultwarden/web-vault:v2025.6.0]
+#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:50662dccf4908ac2128cd44981c52fcb4e3e8dd56f21823c8d5e91267ff741fa
+#     [docker.io/vaultwarden/web-vault:v2025.10.1]
 #
-FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:494be10bd99d9d05c7bec13dad71ad99102ea920de9a5d3587529709a64fb42c AS vault
+FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:50662dccf4908ac2128cd44981c52fcb4e3e8dd56f21823c8d5e91267ff741fa AS vault
 
 ########################## Cross Compile Docker Helper Scripts ##########################
 ## We use the linux/amd64 no matter which Build Platform, since these are all bash scripts
 ## And these bash scripts do not have any significant difference if at all
-FROM --platform=linux/amd64 docker.io/tonistiigi/xx@sha256:9c207bead753dda9430bdd15425c6518fc7a03d866103c516a2c6889188f5894 AS xx
+FROM --platform=linux/amd64 docker.io/tonistiigi/xx@sha256:add602d55daca18914838a78221f6bbe4284114b452c86a48f96d59aeb00f5c6 AS xx
 
 ########################## BUILD IMAGE ##########################
 # hadolint ignore=DL3006
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.87.0-slim-bookworm AS build
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.91.0-slim-trixie AS build
 COPY --from=xx / /
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -51,6 +51,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TERM=xterm-256color \
     CARGO_HOME="/root/.cargo" \
     USER="root"
+
+# Force the install of an older MariaDB library to prevent a Diesel panic
+# See https://github.com/dani-garcia/vaultwarden/issues/6416
+RUN echo "deb http://snapshot.debian.org/archive/debian/20250707T084701Z/ trixie main" > /etc/apt/sources.list.d/snapshot.list && \
+    echo "Acquire::Check-Valid-Until false;" > etc/apt/apt.conf.d/AllowSnapshot && \
+    echo 'Package: libmariadb libmariadb3 libmariadb-dev mariadb*' > /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin: origin "snapshot.debian.org"' >> /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin-Priority: 1001' >> /etc/apt/preferences.d/mariadb-snapshot
 
 # Install clang to get `xx-cargo` working
 # Install pkg-config to allow amd64 builds to find all libraries
@@ -68,15 +76,11 @@ RUN apt-get update && \
     xx-apt-get install -y \
         --no-install-recommends \
         gcc \
-        libmariadb3 \
         libpq-dev \
         libpq5 \
         libssl-dev \
+        libmariadb-dev \
         zlib1g-dev && \
-    # Force install arch dependend mariadb dev packages
-    # Installing them the normal way breaks several other packages (again)
-    apt-get download "libmariadb-dev-compat:$(xx-info debian-arch)" "libmariadb-dev:$(xx-info debian-arch)" && \
-    dpkg --force-all -i ./libmariadb-dev*.deb && \
     # Run xx-cargo early, since it sometimes seems to break when run at a later stage
     echo "export CARGO_TARGET=$(xx-cargo --print-target-triple)" >> /env-cargo
 
@@ -166,7 +170,7 @@ RUN source /env-cargo && \
 # To uninstall: docker run --privileged --rm tonistiigi/binfmt --uninstall 'qemu-*'
 #
 # We need to add `--platform` here, because of a podman bug: https://github.com/containers/buildah/issues/4742
-FROM --platform=$TARGETPLATFORM docker.io/library/debian:bookworm-slim
+FROM --platform=$TARGETPLATFORM docker.io/library/debian:trixie-slim
 
 ENV ROCKET_PROFILE="release" \
     ROCKET_ADDRESS=0.0.0.0 \
@@ -175,11 +179,19 @@ ENV ROCKET_PROFILE="release" \
 
 # Create data folder and Install needed libraries
 RUN mkdir /data && \
+    # Force the install of an older MariaDB library to prevent a Diesel panic
+    # See https://github.com/dani-garcia/vaultwarden/issues/6416
+    echo "deb http://snapshot.debian.org/archive/debian/20250707T084701Z/ trixie main" > /etc/apt/sources.list.d/snapshot.list && \
+    echo "Acquire::Check-Valid-Until false;" > etc/apt/apt.conf.d/AllowSnapshot && \
+    echo 'Package: libmariadb libmariadb3 libmariadb-dev mariadb*' > /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin: origin "snapshot.debian.org"' >> /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin-Priority: 1001' >> /etc/apt/preferences.d/mariadb-snapshot && \
+    # Continue with normal install
     apt-get update && apt-get install -y \
         --no-install-recommends \
         ca-certificates \
         curl \
-        libmariadb-dev-compat \
+        libmariadb3 \
         libpq5 \
         openssl && \
     apt-get clean && \

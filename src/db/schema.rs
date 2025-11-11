@@ -11,8 +11,8 @@ table! {
 table! {
     ciphers (uuid) {
         uuid -> Text,
-        created_at -> Datetime,
-        updated_at -> Datetime,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
         user_uuid -> Nullable<Text>,
         organization_uuid -> Nullable<Text>,
         key -> Nullable<Text>,
@@ -22,7 +22,7 @@ table! {
         fields -> Nullable<Text>,
         data -> Text,
         password_history -> Nullable<Text>,
-        deleted_at -> Nullable<Datetime>,
+        deleted_at -> Nullable<Timestamp>,
         reprompt -> Nullable<Integer>,
     }
 }
@@ -46,8 +46,8 @@ table! {
 table! {
     devices (uuid, user_uuid) {
         uuid -> Text,
-        created_at -> Datetime,
-        updated_at -> Datetime,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
         user_uuid -> Text,
         name -> Text,
         atype -> Integer,
@@ -60,22 +60,22 @@ table! {
 
 table! {
     event (uuid) {
-        uuid -> Varchar,
+        uuid -> Text,
         event_type -> Integer,
-        user_uuid -> Nullable<Varchar>,
-        org_uuid -> Nullable<Varchar>,
-        cipher_uuid -> Nullable<Varchar>,
-        collection_uuid -> Nullable<Varchar>,
-        group_uuid -> Nullable<Varchar>,
-        org_user_uuid -> Nullable<Varchar>,
-        act_user_uuid -> Nullable<Varchar>,
+        user_uuid -> Nullable<Text>,
+        org_uuid -> Nullable<Text>,
+        cipher_uuid -> Nullable<Text>,
+        collection_uuid -> Nullable<Text>,
+        group_uuid -> Nullable<Text>,
+        org_user_uuid -> Nullable<Text>,
+        act_user_uuid -> Nullable<Text>,
         device_type -> Nullable<Integer>,
         ip_address -> Nullable<Text>,
         event_date -> Timestamp,
-        policy_uuid -> Nullable<Varchar>,
-        provider_uuid -> Nullable<Varchar>,
-        provider_user_uuid -> Nullable<Varchar>,
-        provider_org_uuid -> Nullable<Varchar>,
+        policy_uuid -> Nullable<Text>,
+        provider_uuid -> Nullable<Text>,
+        provider_user_uuid -> Nullable<Text>,
+        provider_org_uuid -> Nullable<Text>,
     }
 }
 
@@ -89,8 +89,8 @@ table! {
 table! {
     folders (uuid) {
         uuid -> Text,
-        created_at -> Datetime,
-        updated_at -> Datetime,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
         user_uuid -> Text,
         name -> Text,
     }
@@ -144,10 +144,10 @@ table! {
         password_iter -> Nullable<Integer>,
         max_access_count -> Nullable<Integer>,
         access_count -> Integer,
-        creation_date -> Datetime,
-        revision_date -> Datetime,
-        expiration_date -> Nullable<Datetime>,
-        deletion_date -> Datetime,
+        creation_date -> Timestamp,
+        revision_date -> Timestamp,
+        expiration_date -> Nullable<Timestamp>,
+        deletion_date -> Timestamp,
         disabled -> Bool,
         hide_email -> Nullable<Bool>,
     }
@@ -188,10 +188,10 @@ table! {
     users (uuid) {
         uuid -> Text,
         enabled -> Bool,
-        created_at -> Datetime,
-        updated_at -> Datetime,
-        verified_at -> Nullable<Datetime>,
-        last_verifying_at -> Nullable<Datetime>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+        verified_at -> Nullable<Timestamp>,
+        last_verifying_at -> Nullable<Timestamp>,
         login_verify_count -> Integer,
         email -> Text,
         email_new -> Nullable<Text>,
@@ -235,6 +235,7 @@ table! {
         uuid -> Text,
         user_uuid -> Text,
         org_uuid -> Text,
+        invited_by_email -> Nullable<Text>,
         access_all -> Bool,
         akey -> Text,
         status -> Integer,
@@ -251,6 +252,23 @@ table! {
         atype -> Integer,
         api_key -> Text,
         revision_date -> Timestamp,
+    }
+}
+
+table! {
+    sso_nonce (state) {
+        state -> Text,
+        nonce -> Text,
+        verifier -> Nullable<Text>,
+        redirect_uri -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+table! {
+    sso_users (user_uuid) {
+        user_uuid -> Text,
+        identifier -> Text,
     }
 }
 
@@ -348,6 +366,7 @@ joinable!(collections_groups -> collections (collections_uuid));
 joinable!(collections_groups -> groups (groups_uuid));
 joinable!(event -> users_organizations (uuid));
 joinable!(auth_requests -> users (user_uuid));
+joinable!(sso_users -> users (user_uuid));
 
 allow_tables_to_appear_in_same_query!(
     attachments,
@@ -361,6 +380,7 @@ allow_tables_to_appear_in_same_query!(
     org_policies,
     organizations,
     sends,
+    sso_users,
     twofactor,
     users,
     users_collections,

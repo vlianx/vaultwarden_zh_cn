@@ -2,12 +2,11 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
 use hickory_resolver::{name_server::TokioConnectionProvider, TokioResolver};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{
     dns::{Name, Resolve, Resolving},
@@ -25,9 +24,10 @@ pub fn make_http_request(method: reqwest::Method, url: &str) -> Result<reqwest::
         err!("Invalid host");
     };
 
-    should_block_host(host)?;
+    should_block_host(&host)?;
 
-    static INSTANCE: Lazy<Client> = Lazy::new(|| get_reqwest_client_builder().build().expect("Failed to build client"));
+    static INSTANCE: LazyLock<Client> =
+        LazyLock::new(|| get_reqwest_client_builder().build().expect("Failed to build client"));
 
     Ok(INSTANCE.request(method, url))
 }
@@ -45,7 +45,7 @@ pub fn get_reqwest_client_builder() -> ClientBuilder {
             return attempt.error("Invalid host");
         };
 
-        if let Err(e) = should_block_host(host) {
+        if let Err(e) = should_block_host(&host) {
             return attempt.error(e);
         }
 
@@ -100,11 +100,11 @@ fn should_block_address_regex(domain_or_ip: &str) -> bool {
     is_match
 }
 
-fn should_block_host(host: Host<&str>) -> Result<(), CustomHttpClientError> {
+fn should_block_host(host: &Host<&str>) -> Result<(), CustomHttpClientError> {
     let (ip, host_str): (Option<IpAddr>, String) = match host {
-        Host::Ipv4(ip) => (Some(ip.into()), ip.to_string()),
-        Host::Ipv6(ip) => (Some(ip.into()), ip.to_string()),
-        Host::Domain(d) => (None, d.to_string()),
+        Host::Ipv4(ip) => (Some(IpAddr::V4(*ip)), ip.to_string()),
+        Host::Ipv6(ip) => (Some(IpAddr::V6(*ip)), ip.to_string()),
+        Host::Domain(d) => (None, (*d).to_string()),
     };
 
     if let Some(ip) = ip {
@@ -179,7 +179,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 impl CustomDnsResolver {
     fn instance() -> Arc<Self> {
-        static INSTANCE: Lazy<Arc<CustomDnsResolver>> = Lazy::new(CustomDnsResolver::new);
+        static INSTANCE: LazyLock<Arc<CustomDnsResolver>> = LazyLock::new(CustomDnsResolver::new);
         Arc::clone(&*INSTANCE)
     }
 
@@ -242,5 +242,63 @@ impl Resolve for CustomDnsResolver {
             let result = this.resolve_domain(name).await?;
             Ok::<reqwest::dns::Addrs, _>(Box::new(result.into_iter()))
         })
+    }
+}
+
+#[cfg(s3)]
+pub(crate) mod aws {
+    use aws_smithy_runtime_api::client::{
+        http::{HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector},
+        orchestrator::HttpResponse,
+        result::ConnectorError,
+        runtime_components::RuntimeComponents,
+    };
+    use reqwest::Client;
+
+    // Adapter that wraps reqwest to be compatible with the AWS SDK
+    #[derive(Debug)]
+    pub(crate) struct AwsReqwestConnector {
+        pub(crate) client: Client,
+    }
+
+    impl HttpConnector for AwsReqwestConnector {
+        fn call(&self, request: aws_smithy_runtime_api::client::orchestrator::HttpRequest) -> HttpConnectorFuture {
+            // Convert the AWS-style request to a reqwest request
+            let client = self.client.clone();
+            let future = async move {
+                let method = reqwest::Method::from_bytes(request.method().as_bytes())
+                    .map_err(|e| ConnectorError::user(Box::new(e)))?;
+                let mut req_builder = client.request(method, request.uri().to_string());
+
+                for (name, value) in request.headers() {
+                    req_builder = req_builder.header(name, value);
+                }
+
+                if let Some(body_bytes) = request.body().bytes() {
+                    req_builder = req_builder.body(body_bytes.to_vec());
+                }
+
+                let response = req_builder.send().await.map_err(|e| ConnectorError::io(Box::new(e)))?;
+
+                let status = response.status().into();
+                let bytes = response.bytes().await.map_err(|e| ConnectorError::io(Box::new(e)))?;
+
+                Ok(HttpResponse::new(status, bytes.into()))
+            };
+
+            HttpConnectorFuture::new(Box::pin(future))
+        }
+    }
+
+    impl HttpClient for AwsReqwestConnector {
+        fn http_connector(
+            &self,
+            _settings: &HttpConnectorSettings,
+            _components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(AwsReqwestConnector {
+                client: self.client.clone(),
+            })
+        }
     }
 }

@@ -1,71 +1,127 @@
-/**** 开始 Vaultwarden 静态更改 ****/
-/* 将所有扩展它的选择器合并为一个 */
+/**** START Static Vaultwarden changes ****/
+/* This combines all selectors extending it into one */
 %vw-hide {
   display: none !important;
 }
 
-/* 方便在浏览器开发者工具中（head 标签内）查找该样式 */
+/* This allows searching for the combined style in the browsers dev-tools (look into the head tag) */
 .vw-hide,
 head {
   @extend %vw-hide;
 }
 
-/* 隐藏订阅页面标签 */
+/* Hide the Subscription Page tab */
 bit-nav-item[route="settings/subscription"] {
   @extend %vw-hide;
 }
 
-/* 隐藏指向 Bitwarden 免费家庭的链接 */
+/* Hide any link pointing to Free Bitwarden Families */
 a[href$="/settings/sponsored-families"] {
   @extend %vw-hide;
 }
 
-/* 隐藏登录页的“企业单点登录”按钮 */
-app-root form.ng-untouched button.\!tw-text-primary-600:nth-child(4) {
+/* Hide the sso `Email` input field */
+{{#if (not sso_enabled)}}
+.vw-email-sso {
   @extend %vw-hide;
 }
-/* 隐藏登录页的“使用密钥登录”按钮 */
-app-root form.ng-untouched a[routerlink="/login-with-passkey"] {
-  @extend %vw-hide;
-}
-/* 隐藏上述两个按钮后面的“或”文本 */
-app-root form.ng-untouched > div:nth-child(1) > div:nth-child(3) > div:nth-child(2) {
-  @extend %vw-hide;
-}
+{{/if}}
 
-/* 隐藏组织设置中的双重验证菜单 */
+/* Hide the default/continue `Email` input field */
+{{#if sso_enabled}}
+.vw-email-continue {
+  @extend %vw-hide;
+}
+{{/if}}
+
+/* Hide the `Continue` button on the login page */
+{{#if sso_enabled}}
+.vw-continue-login {
+  @extend %vw-hide;
+}
+{{/if}}
+
+/* Hide the `Enterprise Single Sign-On` button on the login page */
+{{#if (webver ">=2025.5.1")}}
+{{#if (not sso_enabled)}}
+.vw-sso-login {
+  @extend %vw-hide;
+}
+{{/if}}
+{{else}}
+app-root ng-component > form > div:nth-child(1) > div > button[buttontype="secondary"].\!tw-text-primary-600:nth-child(4) {
+  @extend %vw-hide;
+}
+{{/if}}
+
+/* Hide the `Log in with passkey` settings */
+app-user-layout app-password-settings app-webauthn-login-settings {
+  @extend %vw-hide;
+}
+/* Hide Log in with passkey on the login page */
+{{#if (webver ">=2025.5.1")}}
+.vw-passkey-login {
+  @extend %vw-hide;
+}
+{{else}}
+app-root ng-component > form > div:nth-child(1) > div > button[buttontype="secondary"].\!tw-text-primary-600:nth-child(3) {
+  @extend %vw-hide;
+}
+{{/if}}
+
+/* Hide the or text followed by the two buttons hidden above */
+{{#if (webver ">=2025.5.1")}}
+{{#if (or (not sso_enabled) sso_only)}}
+.vw-or-text {
+  @extend %vw-hide;
+}
+{{/if}}
+{{else}}
+app-root ng-component > form > div:nth-child(1) > div:nth-child(3) > div:nth-child(2) {
+  @extend %vw-hide;
+}
+{{/if}}
+
+/* Hide the `Other` button on the login page */
+{{#if (or (not sso_enabled) sso_only)}}
+.vw-other-login {
+  @extend %vw-hide;
+}
+{{/if}}
+
+/* Hide Two-Factor menu in Organization settings */
 bit-nav-item[route="settings/two-factor"],
 a[href$="/settings/two-factor"] {
   @extend %vw-hide;
 }
 
-/* 隐藏组织套餐 */
+/* Hide organization plans */
 app-organization-plans > form > bit-section:nth-child(2) {
   @extend %vw-hide;
 }
 
-/* 隐藏集合管理表单 */
+/* Hide Collection Management Form */
 app-org-account form.ng-untouched:nth-child(5) {
   @extend %vw-hide;
 }
 
-/* 隐藏组织报告中的“成员访问”报告卡片 */
+/* Hide 'Member Access' Report Card from Org Reports */
 app-org-reports-home > app-report-list > div.tw-inline-grid > div:nth-child(6) {
   @extend %vw-hide;
 }
 
-/* 隐藏双重登录页面的设备验证表单 */
+/* Hide Device Verification form at the Two Step Login screen */
 app-security > app-two-factor-setup > form {
   @extend %vw-hide;
 }
 
-/* 隐藏不支持的自定义角色选项 */
+/* Hide unsupported Custom Role options */
 bit-dialog div.tw-ml-4:has(bit-form-control input),
 bit-dialog div.tw-col-span-4:has(input[formcontrolname*="access"], input[formcontrolname*="manage"]) {
   @extend %vw-hide;
 }
 
-/* 折叠菜单图标替换为 Vaultwarden 图标 */
+/* Change collapsed menu icon to Vaultwarden */
 bit-nav-logo bit-nav-item a:before {
   content: "";
   background-image: url("../images/icon-white.svg");
@@ -77,13 +133,20 @@ bit-nav-logo bit-nav-item a:before {
 bit-nav-logo bit-nav-item .bwi-shield {
   @extend %vw-hide;
 }
-/**** 结束 Vaultwarden 静态更改 ****/
-/**** 开始 Vaultwarden 动态更改 ****/
+/* Hide Device Login Protection button on user settings page */
+app-user-layout app-danger-zone button:nth-child(1) {
+  @extend %vw-hide;
+}
+/**** END Static Vaultwarden Changes ****/
+/**** START Dynamic Vaultwarden Changes ****/
 {{#if signup_disabled}}
-/* 从 web vault 2025.1.2 起，当禁用注册时，注册按钮会自动隐藏（web vault 会检查 /api/config 接口）。
-  注意客户端可能会强缓存该接口，变更可能需要一段时间生效。为避免按钮异常显示，保留此样式以兼容部分版本 */
+/* From web vault 2025.1.2 and onwards, the signup button is hidden
+  when signups are disabled as the web vault checks the /api/config endpoint.
+  Note that the clients tend to cache this endpoint for about 1 hour, so it might
+  take a while for the change to take effect. To avoid the button appearing
+  when it shouldn't, we'll keep this style in place for a couple of versions */
+/* Hide the register link on the login screen */
 {{#if (webver "<2025.3.0")}}
-/* 隐藏登录页的注册链接 */
 app-login form div + div + div + div + hr,
 app-login form div + div + div + div + hr + p {
   @extend %vw-hide;
@@ -95,35 +158,42 @@ app-root a[routerlink="/signup"] {
 {{/if}}
 {{/if}}
 
-{{#unless mail_enabled}}
-/* 如果未启用邮件，则隐藏“邮箱”二步验证 */
+{{#unless mail_2fa_enabled}}
+/* Hide `Email` 2FA if mail is not enabled */
 .providers-2fa-1 {
   @extend %vw-hide;
 }
 {{/unless}}
 
 {{#unless yubico_enabled}}
-/* 如果未启用，则隐藏“YubiKey OTP 安全密钥”二步验证 */
+/* Hide `YubiKey OTP security key` 2FA if it is not enabled */
 .providers-2fa-3 {
   @extend %vw-hide;
 }
 {{/unless}}
 
+{{#unless webauthn_2fa_supported}}
+/* Hide `Passkey` 2FA if it is not supported */
+.providers-2fa-7 {
+  @extend %vw-hide;
+}
+{{/unless}}
+
 {{#unless emergency_access_allowed}}
-/* 如果不允许，则隐藏紧急访问 */
+/* Hide Emergency Access if not allowed */
 bit-nav-item[route="settings/emergency-access"] {
   @extend %vw-hide;
 }
 {{/unless}}
 
 {{#unless sends_allowed}}
-/* 如果不允许，则隐藏 Sends */
+/* Hide Sends if not allowed */
 bit-nav-item[route="sends"] {
   @extend %vw-hide;
 }
 {{/unless}}
-/**** 结束 Vaultwarden 动态更改 ****/
-/**** 引入用户自定义样式表 ****/
+/**** End Dynamic Vaultwarden Changes ****/
+/**** Include a special user stylesheet for custom changes ****/
 {{#if load_user_scss}}
 {{> scss/user.vaultwarden.scss }}
 {{/if}}

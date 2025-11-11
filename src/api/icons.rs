@@ -1,21 +1,20 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::{stream::StreamExt, TryFutureExt};
-use once_cell::sync::Lazy;
+use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
 use regex::Regex;
 use reqwest::{
     header::{self, HeaderMap, HeaderValue},
     Client, Response,
 };
 use rocket::{http::ContentType, response::Redirect, Route};
-
-use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
+use svg_hush::{data_url_filter, Filter};
 
 use crate::{
     config::PathType,
@@ -32,14 +31,32 @@ pub fn routes() -> Vec<Route> {
     }
 }
 
-static CLIENT: Lazy<Client> = Lazy::new(|| {
+static CLIENT: LazyLock<Client> = LazyLock::new(|| {
     // Generate the default headers
     let mut default_headers = HeaderMap::new();
-    default_headers.insert(header::USER_AGENT, HeaderValue::from_static("Links (2.22; Linux X86_64; GNU C; text)"));
-    default_headers.insert(header::ACCEPT, HeaderValue::from_static("text/html, text/*;q=0.5, image/*, */*;q=0.1"));
-    default_headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en,*;q=0.1"));
+    default_headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        ),
+    );
+    default_headers.insert(header::ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"));
+    default_headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
     default_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     default_headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    default_headers.insert(header::UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
+
+    default_headers.insert("Sec-Ch-Ua-Mobile", HeaderValue::from_static("?0"));
+    default_headers.insert("Sec-Ch-Ua-Platform", HeaderValue::from_static("Linux"));
+    default_headers.insert(
+        "Sec-Ch-Ua",
+        HeaderValue::from_static("\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\""),
+    );
+
+    default_headers.insert("Sec-Fetch-Site", HeaderValue::from_static("none"));
+    default_headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("navigate"));
+    default_headers.insert("Sec-Fetch-User", HeaderValue::from_static("?1"));
+    default_headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("document"));
 
     // Generate the cookie store
     let cookie_store = Arc::new(Jar::default());
@@ -53,12 +70,13 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
         .pool_max_idle_per_host(5) // Configure the Hyper Pool to only have max 5 idle connections
         .pool_idle_timeout(pool_idle_timeout) // Configure the Hyper Pool to timeout after 10 seconds
         .default_headers(default_headers.clone())
+        .http1_title_case_headers()
         .build()
         .expect("Failed to build client")
 });
 
 // Build Regex only once since this takes a lot of time.
-static ICON_SIZE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
+static ICON_SIZE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
 
 // The function name `icon_external` is checked in the `on_response` function in `AppHeaders`
 // It is used to prevent sending a specific header which breaks icon downloads.
@@ -200,7 +218,7 @@ async fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
     }
 
     // Try to read the cached icon, and return it if it exists
-    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(PathType::IconCache) {
+    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
         if let Ok(buf) = operator.read(path).await {
             return Some(buf.to_vec());
         }
@@ -210,7 +228,7 @@ async fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
 }
 
 async fn file_is_expired(path: &str, ttl: u64) -> Result<bool, Error> {
-    let operator = CONFIG.opendal_operator_for_path_type(PathType::IconCache)?;
+    let operator = CONFIG.opendal_operator_for_path_type(&PathType::IconCache)?;
     let meta = operator.stat(path).await?;
     let modified =
         meta.last_modified().ok_or_else(|| std::io::Error::other(format!("No last modified time for `{path}`")))?;
@@ -226,7 +244,7 @@ async fn icon_is_negcached(path: &str) -> bool {
     match expired {
         // No longer negatively cached, drop the marker
         Ok(true) => {
-            match CONFIG.opendal_operator_for_path_type(PathType::IconCache) {
+            match CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
                 Ok(operator) => {
                     if let Err(e) = operator.delete(&miss_indicator).await {
                         error!("Could not remove negative cache indicator for icon {path:?}: {e:?}");
@@ -318,7 +336,7 @@ struct IconUrlResult {
 
 /// Returns a IconUrlResult which holds a Vector IconList and a string which holds the referer.
 /// There will always two items within the iconlist which holds http(s)://domain.tld/favicon.ico.
-/// This does not mean that that location does exists, but it is the default location browser use.
+/// This does not mean that location exists, but (it) is the default location the browser uses.
 ///
 /// # Argument
 /// * `domain` - A string which holds the domain with extension.
@@ -442,8 +460,8 @@ async fn get_page_with_referer(url: &str, referer: &str) -> Result<Response, Err
 /// priority2 = get_icon_priority("https://example.com/path/to/a/favicon.ico", "");
 /// ```
 fn get_icon_priority(href: &str, sizes: &str) -> u8 {
-    static PRIORITY_MAP: Lazy<HashMap<&'static str, u8>> =
-        Lazy::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
+    static PRIORITY_MAP: LazyLock<HashMap<&'static str, u8>> =
+        LazyLock::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
 
     // Check if there is a dimension set
     let (width, height) = parse_sizes(sizes);
@@ -561,13 +579,23 @@ async fn download_icon(domain: &str) -> Result<(Bytes, Option<&str>), Error> {
 
     if buffer.is_empty() {
         err_silent!("Empty response or unable find a valid icon", domain);
+    } else if icon_type == Some("svg+xml") {
+        let mut svg_filter = Filter::new();
+        svg_filter.set_data_url_filter(data_url_filter::allow_standard_images);
+        let mut sanitized_svg = Vec::new();
+        if svg_filter.filter(&*buffer, &mut sanitized_svg).is_err() {
+            icon_type = None;
+            buffer.clear();
+        } else {
+            buffer = sanitized_svg.into();
+        }
     }
 
     Ok((buffer, icon_type))
 }
 
 async fn save_icon(path: &str, icon: Vec<u8>) {
-    let operator = match CONFIG.opendal_operator_for_path_type(PathType::IconCache) {
+    let operator = match CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
         Ok(operator) => operator,
         Err(e) => {
             warn!("Failed to get OpenDAL operator while saving icon: {e}");
@@ -581,6 +609,16 @@ async fn save_icon(path: &str, icon: Vec<u8>) {
 }
 
 fn get_icon_type(bytes: &[u8]) -> Option<&'static str> {
+    fn check_svg_after_xml_declaration(bytes: &[u8]) -> Option<&'static str> {
+        // Look for SVG tag within the first 1KB
+        if let Ok(content) = std::str::from_utf8(&bytes[..bytes.len().min(1024)]) {
+            if content.contains("<svg") || content.contains("<SVG") {
+                return Some("svg+xml");
+            }
+        }
+        None
+    }
+
     match bytes {
         [137, 80, 78, 71, ..] => Some("png"),
         [0, 0, 1, 0, ..] => Some("x-icon"),
@@ -588,6 +626,8 @@ fn get_icon_type(bytes: &[u8]) -> Option<&'static str> {
         [255, 216, 255, ..] => Some("jpeg"),
         [71, 73, 70, 56, ..] => Some("gif"),
         [66, 77, ..] => Some("bmp"),
+        [60, 115, 118, 103, ..] => Some("svg+xml"), // Normal svg
+        [60, 63, 120, 109, 108, ..] => check_svg_after_xml_declaration(bytes), // An svg starting with <?xml
         _ => None,
     }
 }
@@ -599,6 +639,12 @@ async fn stream_to_bytes_limit(res: Response, max_size: usize) -> Result<Bytes, 
     let mut buf = BytesMut::new();
     let mut size = 0;
     while let Some(chunk) = stream.next().await {
+        // It is possible that there might occur UnexpectedEof errors or others
+        // This is most of the time no issue, and if there is no chunked data anymore or at all parsing the HTML will not happen anyway.
+        // Therefore if chunk is an err, just break and continue with the data be have received.
+        if chunk.is_err() {
+            break;
+        }
         let chunk = &chunk?;
         size += chunk.len();
         buf.extend(chunk);
