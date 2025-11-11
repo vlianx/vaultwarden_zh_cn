@@ -83,19 +83,19 @@ async fn verify_yubikey_otp(otp: String) -> EmptyResult {
 }
 
 #[post("/two-factor/get-yubikey", data = "<data>")]
-async fn generate_yubikey(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn generate_yubikey(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
     // Make sure the credentials are set
     get_yubico_credentials()?;
 
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
-    data.validate(&user, false, &mut conn).await?;
+    data.validate(&user, false, &conn).await?;
 
     let user_id = &user.uuid;
     let yubikey_type = TwoFactorType::YubiKey as i32;
 
-    let r = TwoFactor::find_by_user_and_type(user_id, yubikey_type, &mut conn).await;
+    let r = TwoFactor::find_by_user_and_type(user_id, yubikey_type, &conn).await;
 
     if let Some(r) = r {
         let yubikey_metadata: YubikeyMetadata = serde_json::from_str(&r.data)?;
@@ -116,7 +116,7 @@ async fn generate_yubikey(data: Json<PasswordOrOtpData>, headers: Headers, mut c
 }
 
 #[post("/two-factor/yubikey", data = "<data>")]
-async fn activate_yubikey(data: Json<EnableYubikeyData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn activate_yubikey(data: Json<EnableYubikeyData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: EnableYubikeyData = data.into_inner();
     let mut user = headers.user;
 
@@ -124,12 +124,12 @@ async fn activate_yubikey(data: Json<EnableYubikeyData>, headers: Headers, mut c
         master_password_hash: data.master_password_hash.clone(),
         otp: data.otp.clone(),
     }
-    .validate(&user, true, &mut conn)
+    .validate(&user, true, &conn)
     .await?;
 
     // Check if we already have some data
     let mut yubikey_data =
-        match TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::YubiKey as i32, &mut conn).await {
+        match TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::YubiKey as i32, &conn).await {
             Some(data) => data,
             None => TwoFactor::new(user.uuid.clone(), TwoFactorType::YubiKey, String::new()),
         };
@@ -145,15 +145,14 @@ async fn activate_yubikey(data: Json<EnableYubikeyData>, headers: Headers, mut c
 
     // Ensure they are valid OTPs
     for yubikey in &yubikeys {
-        if yubikey.len() == 12 {
-            // YubiKey ID
+        if yubikey.is_empty() || yubikey.len() == 12 {
             continue;
         }
 
         verify_yubikey_otp(yubikey.to_owned()).await.map_res("Invalid Yubikey OTP provided")?;
     }
 
-    let yubikey_ids: Vec<String> = yubikeys.into_iter().map(|x| (x[..12]).to_owned()).collect();
+    let yubikey_ids: Vec<String> = yubikeys.into_iter().filter_map(|x| x.get(..12).map(str::to_owned)).collect();
 
     let yubikey_metadata = YubikeyMetadata {
         keys: yubikey_ids,
@@ -161,11 +160,11 @@ async fn activate_yubikey(data: Json<EnableYubikeyData>, headers: Headers, mut c
     };
 
     yubikey_data.data = serde_json::to_string(&yubikey_metadata).unwrap();
-    yubikey_data.save(&mut conn).await?;
+    yubikey_data.save(&conn).await?;
 
-    _generate_recover_code(&mut user, &mut conn).await;
+    _generate_recover_code(&mut user, &conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &mut conn).await;
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
 
     let mut result = jsonify_yubikeys(yubikey_metadata.keys);
 

@@ -1,15 +1,10 @@
-use rocket::serde::json::Json;
-use rocket::Route;
-use serde_json::Value;
-use url::Url;
-use webauthn_rs::{base64_data::Base64UrlSafeData, proto::*, AuthenticationState, RegistrationState, Webauthn};
-
 use crate::{
     api::{
         core::{log_user_event, two_factor::_generate_recover_code},
         EmptyResult, JsonResult, PasswordOrOtpData,
     },
     auth::Headers,
+    crypto::ct_eq,
     db::{
         models::{EventType, TwoFactor, TwoFactorType, UserId},
         DbConn,
@@ -18,6 +13,35 @@ use crate::{
     util::NumberOrString,
     CONFIG,
 };
+use rocket::serde::json::Json;
+use rocket::Route;
+use serde_json::Value;
+use std::str::FromStr;
+use std::sync::LazyLock;
+use std::time::Duration;
+use url::Url;
+use uuid::Uuid;
+use webauthn_rs::prelude::{Base64UrlSafeData, Credential, Passkey, PasskeyAuthentication, PasskeyRegistration};
+use webauthn_rs::{Webauthn, WebauthnBuilder};
+use webauthn_rs_proto::{
+    AuthenticationExtensionsClientOutputs, AuthenticatorAssertionResponseRaw, AuthenticatorAttestationResponseRaw,
+    PublicKeyCredential, RegisterPublicKeyCredential, RegistrationExtensionsClientOutputs,
+    RequestAuthenticationExtensions, UserVerificationPolicy,
+};
+
+static WEBAUTHN: LazyLock<Webauthn> = LazyLock::new(|| {
+    let domain = CONFIG.domain();
+    let domain_origin = CONFIG.domain_origin();
+    let rp_id = Url::parse(&domain).map(|u| u.domain().map(str::to_owned)).ok().flatten().unwrap_or_default();
+    let rp_origin = Url::parse(&domain_origin).unwrap();
+
+    let webauthn = WebauthnBuilder::new(&rp_id, &rp_origin)
+        .expect("Creating WebauthnBuilder failed")
+        .rp_name(&domain)
+        .timeout(Duration::from_millis(60000));
+
+    webauthn.build().expect("Building Webauthn failed")
+});
 
 pub fn routes() -> Vec<Route> {
     routes![get_webauthn, generate_webauthn_challenge, activate_webauthn, activate_webauthn_put, delete_webauthn,]
@@ -45,52 +69,13 @@ pub struct U2FRegistration {
     pub migrated: Option<bool>,
 }
 
-struct WebauthnConfig {
-    url: String,
-    origin: Url,
-    rpid: String,
-}
-
-impl WebauthnConfig {
-    fn load() -> Webauthn<Self> {
-        let domain = CONFIG.domain();
-        let domain_origin = CONFIG.domain_origin();
-        Webauthn::new(Self {
-            rpid: Url::parse(&domain).map(|u| u.domain().map(str::to_owned)).ok().flatten().unwrap_or_default(),
-            url: domain,
-            origin: Url::parse(&domain_origin).unwrap(),
-        })
-    }
-}
-
-impl webauthn_rs::WebauthnConfig for WebauthnConfig {
-    fn get_relying_party_name(&self) -> &str {
-        &self.url
-    }
-
-    fn get_origin(&self) -> &Url {
-        &self.origin
-    }
-
-    fn get_relying_party_id(&self) -> &str {
-        &self.rpid
-    }
-
-    /// We have WebAuthn configured to discourage user verification
-    /// if we leave this enabled, it will cause verification issues when a keys send UV=1.
-    /// Upstream (the library they use) ignores this when set to discouraged, so we should too.
-    fn get_require_uv_consistency(&self) -> bool {
-        false
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WebauthnRegistration {
     pub id: i32,
     pub name: String,
     pub migrated: bool,
 
-    pub credential: Credential,
+    pub credential: Passkey,
 }
 
 impl WebauthnRegistration {
@@ -101,10 +86,28 @@ impl WebauthnRegistration {
             "migrated": self.migrated,
         })
     }
+
+    fn set_backup_eligible(&mut self, backup_eligible: bool, backup_state: bool) -> bool {
+        let mut changed = false;
+        let mut cred: Credential = self.credential.clone().into();
+
+        if cred.backup_state != backup_state {
+            cred.backup_state = backup_state;
+            changed = true;
+        }
+
+        if backup_eligible && !cred.backup_eligible {
+            cred.backup_eligible = true;
+            changed = true;
+        }
+
+        self.credential = cred.into();
+        changed
+    }
 }
 
 #[post("/two-factor/get-webauthn", data = "<data>")]
-async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
     if !CONFIG.domain_set() {
         err!("`DOMAIN` environment variable is not set. Webauthn disabled")
     }
@@ -112,9 +115,9 @@ async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, mut conn:
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
-    data.validate(&user, false, &mut conn).await?;
+    data.validate(&user, false, &conn).await?;
 
-    let (enabled, registrations) = get_webauthn_registrations(&user.uuid, &mut conn).await?;
+    let (enabled, registrations) = get_webauthn_registrations(&user.uuid, &conn).await?;
     let registrations_json: Vec<Value> = registrations.iter().map(WebauthnRegistration::to_json).collect();
 
     Ok(Json(json!({
@@ -125,30 +128,39 @@ async fn get_webauthn(data: Json<PasswordOrOtpData>, headers: Headers, mut conn:
 }
 
 #[post("/two-factor/get-webauthn-challenge", data = "<data>")]
-async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn generate_webauthn_challenge(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
-    data.validate(&user, false, &mut conn).await?;
+    data.validate(&user, false, &conn).await?;
 
-    let registrations = get_webauthn_registrations(&user.uuid, &mut conn)
+    let registrations = get_webauthn_registrations(&user.uuid, &conn)
         .await?
         .1
         .into_iter()
-        .map(|r| r.credential.cred_id) // We return the credentialIds to the clients to avoid double registering
+        .map(|r| r.credential.cred_id().to_owned()) // We return the credentialIds to the clients to avoid double registering
         .collect();
 
-    let (challenge, state) = WebauthnConfig::load().generate_challenge_register_options(
-        user.uuid.as_bytes().to_vec(),
-        user.email,
-        user.name,
+    let (mut challenge, state) = WEBAUTHN.start_passkey_registration(
+        Uuid::from_str(&user.uuid).expect("Failed to parse UUID"), // Should never fail
+        &user.email,
+        &user.name,
         Some(registrations),
-        None,
-        None,
     )?;
 
+    let mut state = serde_json::to_value(&state)?;
+    state["rs"]["policy"] = Value::String("discouraged".to_string());
+    state["rs"]["extensions"].as_object_mut().unwrap().clear();
+
     let type_ = TwoFactorType::WebauthnRegisterChallenge;
-    TwoFactor::new(user.uuid.clone(), type_, serde_json::to_string(&state)?).save(&mut conn).await?;
+    TwoFactor::new(user.uuid.clone(), type_, serde_json::to_string(&state)?).save(&conn).await?;
+
+    // Because for this flow we abuse the passkeys as 2FA, and use it more like a securitykey
+    // we need to modify some of the default settings defined by `start_passkey_registration()`.
+    challenge.public_key.extensions = None;
+    if let Some(asc) = challenge.public_key.authenticator_selection.as_mut() {
+        asc.user_verification = UserVerificationPolicy::Discouraged_DO_NOT_USE;
+    }
 
     let mut challenge_value = serde_json::to_value(challenge.public_key)?;
     challenge_value["status"] = "ok".into();
@@ -193,8 +205,10 @@ impl From<RegisterPublicKeyCredentialCopy> for RegisterPublicKeyCredential {
             response: AuthenticatorAttestationResponseRaw {
                 attestation_object: r.response.attestation_object,
                 client_data_json: r.response.client_data_json,
+                transports: None,
             },
             type_: r.r#type,
+            extensions: RegistrationExtensionsClientOutputs::default(),
         }
     }
 }
@@ -205,7 +219,7 @@ pub struct PublicKeyCredentialCopy {
     pub id: String,
     pub raw_id: Base64UrlSafeData,
     pub response: AuthenticatorAssertionResponseRawCopy,
-    pub extensions: Option<AuthenticationExtensionsClientOutputs>,
+    pub extensions: AuthenticationExtensionsClientOutputs,
     pub r#type: String,
 }
 
@@ -238,7 +252,7 @@ impl From<PublicKeyCredentialCopy> for PublicKeyCredential {
 }
 
 #[post("/two-factor/webauthn", data = "<data>")]
-async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: EnableWebauthnData = data.into_inner();
     let mut user = headers.user;
 
@@ -246,25 +260,24 @@ async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, mut
         master_password_hash: data.master_password_hash,
         otp: data.otp,
     }
-    .validate(&user, true, &mut conn)
+    .validate(&user, true, &conn)
     .await?;
 
     // Retrieve and delete the saved challenge state
     let type_ = TwoFactorType::WebauthnRegisterChallenge as i32;
-    let state = match TwoFactor::find_by_user_and_type(&user.uuid, type_, &mut conn).await {
+    let state = match TwoFactor::find_by_user_and_type(&user.uuid, type_, &conn).await {
         Some(tf) => {
-            let state: RegistrationState = serde_json::from_str(&tf.data)?;
-            tf.delete(&mut conn).await?;
+            let state: PasskeyRegistration = serde_json::from_str(&tf.data)?;
+            tf.delete(&conn).await?;
             state
         }
         None => err!("Can't recover challenge"),
     };
 
     // Verify the credentials with the saved state
-    let (credential, _data) =
-        WebauthnConfig::load().register_credential(&data.device_response.into(), &state, |_| Ok(false))?;
+    let credential = WEBAUTHN.finish_passkey_registration(&data.device_response.into(), &state)?;
 
-    let mut registrations: Vec<_> = get_webauthn_registrations(&user.uuid, &mut conn).await?.1;
+    let mut registrations: Vec<_> = get_webauthn_registrations(&user.uuid, &conn).await?.1;
     // TODO: Check for repeated ID's
     registrations.push(WebauthnRegistration {
         id: data.id.into_i32()?,
@@ -276,11 +289,11 @@ async fn activate_webauthn(data: Json<EnableWebauthnData>, headers: Headers, mut
 
     // Save the registrations and return them
     TwoFactor::new(user.uuid.clone(), TwoFactorType::Webauthn, serde_json::to_string(&registrations)?)
-        .save(&mut conn)
+        .save(&conn)
         .await?;
-    _generate_recover_code(&mut user, &mut conn).await;
+    _generate_recover_code(&mut user, &conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &mut conn).await;
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
 
     let keys_json: Vec<Value> = registrations.iter().map(WebauthnRegistration::to_json).collect();
     Ok(Json(json!({
@@ -303,14 +316,14 @@ struct DeleteU2FData {
 }
 
 #[delete("/two-factor/webauthn", data = "<data>")]
-async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, conn: DbConn) -> JsonResult {
     let id = data.id.into_i32()?;
     if !headers.user.check_valid_password(&data.master_password_hash) {
         err!("Invalid password");
     }
 
     let Some(mut tf) =
-        TwoFactor::find_by_user_and_type(&headers.user.uuid, TwoFactorType::Webauthn as i32, &mut conn).await
+        TwoFactor::find_by_user_and_type(&headers.user.uuid, TwoFactorType::Webauthn as i32, &conn).await
     else {
         err!("Webauthn data not found!")
     };
@@ -323,23 +336,22 @@ async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, mut conn: 
 
     let removed_item = data.remove(item_pos);
     tf.data = serde_json::to_string(&data)?;
-    tf.save(&mut conn).await?;
+    tf.save(&conn).await?;
     drop(tf);
 
     // If entry is migrated from u2f, delete the u2f entry as well
-    if let Some(mut u2f) =
-        TwoFactor::find_by_user_and_type(&headers.user.uuid, TwoFactorType::U2f as i32, &mut conn).await
+    if let Some(mut u2f) = TwoFactor::find_by_user_and_type(&headers.user.uuid, TwoFactorType::U2f as i32, &conn).await
     {
         let mut data: Vec<U2FRegistration> = match serde_json::from_str(&u2f.data) {
             Ok(d) => d,
             Err(_) => err!("Error parsing U2F data"),
         };
 
-        data.retain(|r| r.reg.key_handle != removed_item.credential.cred_id);
+        data.retain(|r| r.reg.key_handle != removed_item.credential.cred_id().as_slice());
         let new_data_str = serde_json::to_string(&data)?;
 
         u2f.data = new_data_str;
-        u2f.save(&mut conn).await?;
+        u2f.save(&conn).await?;
     }
 
     let keys_json: Vec<Value> = data.iter().map(WebauthnRegistration::to_json).collect();
@@ -353,7 +365,7 @@ async fn delete_webauthn(data: Json<DeleteU2FData>, headers: Headers, mut conn: 
 
 pub async fn get_webauthn_registrations(
     user_id: &UserId,
-    conn: &mut DbConn,
+    conn: &DbConn,
 ) -> Result<(bool, Vec<WebauthnRegistration>), Error> {
     let type_ = TwoFactorType::Webauthn as i32;
     match TwoFactor::find_by_user_and_type(user_id, type_, conn).await {
@@ -362,9 +374,9 @@ pub async fn get_webauthn_registrations(
     }
 }
 
-pub async fn generate_webauthn_login(user_id: &UserId, conn: &mut DbConn) -> JsonResult {
+pub async fn generate_webauthn_login(user_id: &UserId, conn: &DbConn) -> JsonResult {
     // Load saved credentials
-    let creds: Vec<Credential> =
+    let creds: Vec<Passkey> =
         get_webauthn_registrations(user_id, conn).await?.1.into_iter().map(|r| r.credential).collect();
 
     if creds.is_empty() {
@@ -372,8 +384,26 @@ pub async fn generate_webauthn_login(user_id: &UserId, conn: &mut DbConn) -> Jso
     }
 
     // Generate a challenge based on the credentials
-    let ext = RequestAuthenticationExtensions::builder().appid(format!("{}/app-id.json", &CONFIG.domain())).build();
-    let (response, state) = WebauthnConfig::load().generate_challenge_authenticate_options(creds, Some(ext))?;
+    let (mut response, state) = WEBAUTHN.start_passkey_authentication(&creds)?;
+
+    // Modify to discourage user verification
+    let mut state = serde_json::to_value(&state)?;
+    state["ast"]["policy"] = Value::String("discouraged".to_string());
+
+    // Add appid, this is only needed for U2F compatibility, so maybe it can be removed as well
+    let app_id = format!("{}/app-id.json", &CONFIG.domain());
+    state["ast"]["appid"] = Value::String(app_id.clone());
+
+    response.public_key.user_verification = UserVerificationPolicy::Discouraged_DO_NOT_USE;
+    response
+        .public_key
+        .extensions
+        .get_or_insert(RequestAuthenticationExtensions {
+            appid: None,
+            uvm: None,
+            hmac_get_secret: None,
+        })
+        .appid = Some(app_id);
 
     // Save the challenge state for later validation
     TwoFactor::new(user_id.clone(), TwoFactorType::WebauthnLoginChallenge, serde_json::to_string(&state)?)
@@ -384,11 +414,11 @@ pub async fn generate_webauthn_login(user_id: &UserId, conn: &mut DbConn) -> Jso
     Ok(Json(serde_json::to_value(response.public_key)?))
 }
 
-pub async fn validate_webauthn_login(user_id: &UserId, response: &str, conn: &mut DbConn) -> EmptyResult {
+pub async fn validate_webauthn_login(user_id: &UserId, response: &str, conn: &DbConn) -> EmptyResult {
     let type_ = TwoFactorType::WebauthnLoginChallenge as i32;
-    let state = match TwoFactor::find_by_user_and_type(user_id, type_, conn).await {
+    let mut state = match TwoFactor::find_by_user_and_type(user_id, type_, conn).await {
         Some(tf) => {
-            let state: AuthenticationState = serde_json::from_str(&tf.data)?;
+            let state: PasskeyAuthentication = serde_json::from_str(&tf.data)?;
             tf.delete(conn).await?;
             state
         }
@@ -405,17 +435,22 @@ pub async fn validate_webauthn_login(user_id: &UserId, response: &str, conn: &mu
 
     let mut registrations = get_webauthn_registrations(user_id, conn).await?.1;
 
-    // If the credential we received is migrated from U2F, enable the U2F compatibility
-    //let use_u2f = registrations.iter().any(|r| r.migrated && r.credential.cred_id == rsp.raw_id.0);
-    let (cred_id, auth_data) = WebauthnConfig::load().authenticate_credential(&rsp, &state)?;
+    // We need to check for and update the backup_eligible flag when needed.
+    // Vaultwarden did not have knowledge of this flag prior to migrating to webauthn-rs v0.5.x
+    // Because of this we check the flag at runtime and update the registrations and state when needed
+    check_and_update_backup_eligible(user_id, &rsp, &mut registrations, &mut state, conn).await?;
+
+    let authentication_result = WEBAUTHN.finish_passkey_authentication(&rsp, &state)?;
 
     for reg in &mut registrations {
-        if &reg.credential.cred_id == cred_id {
-            reg.credential.counter = auth_data.counter;
-
-            TwoFactor::new(user_id.clone(), TwoFactorType::Webauthn, serde_json::to_string(&registrations)?)
-                .save(conn)
-                .await?;
+        if ct_eq(reg.credential.cred_id(), authentication_result.cred_id()) {
+            // If the cred id matches and the credential is updated, Some(true) is returned
+            // In those cases, update the record, else leave it alone
+            if reg.credential.update_credential(&authentication_result) == Some(true) {
+                TwoFactor::new(user_id.clone(), TwoFactorType::Webauthn, serde_json::to_string(&registrations)?)
+                    .save(conn)
+                    .await?;
+            }
             return Ok(());
         }
     }
@@ -426,4 +461,67 @@ pub async fn validate_webauthn_login(user_id: &UserId, response: &str, conn: &mu
             event: EventType::UserFailedLogIn2fa
         }
     )
+}
+
+async fn check_and_update_backup_eligible(
+    user_id: &UserId,
+    rsp: &PublicKeyCredential,
+    registrations: &mut Vec<WebauthnRegistration>,
+    state: &mut PasskeyAuthentication,
+    conn: &DbConn,
+) -> EmptyResult {
+    // The feature flags from the response
+    // For details see: https://www.w3.org/TR/webauthn-3/#sctn-authenticator-data
+    const FLAG_BACKUP_ELIGIBLE: u8 = 0b0000_1000;
+    const FLAG_BACKUP_STATE: u8 = 0b0001_0000;
+
+    if let Some(bits) = rsp.response.authenticator_data.get(32) {
+        let backup_eligible = 0 != (bits & FLAG_BACKUP_ELIGIBLE);
+        let backup_state = 0 != (bits & FLAG_BACKUP_STATE);
+
+        // If the current key is backup eligible, then we probably need to update one of the keys already stored in the database
+        // This is needed because Vaultwarden didn't store this information when using the previous version of webauthn-rs since it was a new addition to the protocol
+        // Because we store multiple keys in one json string, we need to fetch the correct key first, and update its information before we let it verify
+        if backup_eligible {
+            let rsp_id = rsp.raw_id.as_slice();
+            for reg in &mut *registrations {
+                if ct_eq(reg.credential.cred_id().as_slice(), rsp_id) {
+                    // Try to update the key, and if needed also update the database, before the actual state check is done
+                    if reg.set_backup_eligible(backup_eligible, backup_state) {
+                        TwoFactor::new(
+                            user_id.clone(),
+                            TwoFactorType::Webauthn,
+                            serde_json::to_string(&registrations)?,
+                        )
+                        .save(conn)
+                        .await?;
+
+                        // We also need to adjust the current state which holds the challenge used to start the authentication verification
+                        // Because Vaultwarden supports multiple keys, we need to loop through the deserialized state and check which key to update
+                        let mut raw_state = serde_json::to_value(&state)?;
+                        if let Some(credentials) = raw_state
+                            .get_mut("ast")
+                            .and_then(|v| v.get_mut("credentials"))
+                            .and_then(|v| v.as_array_mut())
+                        {
+                            for cred in credentials.iter_mut() {
+                                if cred.get("cred_id").is_some_and(|v| {
+                                    // Deserialize to a [u8] so it can be compared using `ct_eq` with the `rsp_id`
+                                    let cred_id_slice: Base64UrlSafeData = serde_json::from_value(v.clone()).unwrap();
+                                    ct_eq(cred_id_slice, rsp_id)
+                                }) {
+                                    cred["backup_eligible"] = Value::Bool(backup_eligible);
+                                    cred["backup_state"] = Value::Bool(backup_state);
+                                }
+                            }
+                        }
+
+                        *state = serde_json::from_value(raw_state)?;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

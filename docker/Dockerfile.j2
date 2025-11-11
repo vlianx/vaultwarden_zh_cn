@@ -63,12 +63,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME="/root/.cargo" \
     USER="root"
 {%- if base == "alpine" %} \
-    # Use PostgreSQL v15 during Alpine/MUSL builds instead of the default v11
-    # Debian Bookworm already contains libpq v15
-    PQ_LIB_DIR="/usr/local/musl/pq15/lib"
+    # Use PostgreSQL v17 during Alpine/MUSL builds instead of the default v16
+    # Debian Trixie uses libpq v17
+    PQ_LIB_DIR="/usr/local/musl/pq17/lib"
 {% endif %}
 
 {% if base == "debian" %}
+
+# Force the install of an older MariaDB library to prevent a Diesel panic
+# See https://github.com/dani-garcia/vaultwarden/issues/6416
+RUN echo "deb http://snapshot.debian.org/archive/debian/20250707T084701Z/ trixie main" > /etc/apt/sources.list.d/snapshot.list && \
+    echo "Acquire::Check-Valid-Until false;" > etc/apt/apt.conf.d/AllowSnapshot && \
+    echo 'Package: libmariadb libmariadb3 libmariadb-dev mariadb*' > /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin: origin "snapshot.debian.org"' >> /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin-Priority: 1001' >> /etc/apt/preferences.d/mariadb-snapshot
 
 # Install clang to get `xx-cargo` working
 # Install pkg-config to allow amd64 builds to find all libraries
@@ -86,15 +94,11 @@ RUN apt-get update && \
     xx-apt-get install -y \
         --no-install-recommends \
         gcc \
-        libmariadb3 \
         libpq-dev \
         libpq5 \
         libssl-dev \
+        libmariadb-dev \
         zlib1g-dev && \
-    # Force install arch dependend mariadb dev packages
-    # Installing them the normal way breaks several other packages (again)
-    apt-get download "libmariadb-dev-compat:$(xx-info debian-arch)" "libmariadb-dev:$(xx-info debian-arch)" && \
-    dpkg --force-all -i ./libmariadb-dev*.deb && \
     # Run xx-cargo early, since it sometimes seems to break when run at a later stage
     echo "export CARGO_TARGET=$(xx-cargo --print-target-triple)" >> /env-cargo
 {% endif %}
@@ -212,11 +216,19 @@ ENV ROCKET_PROFILE="release" \
 # Create data folder and Install needed libraries
 RUN mkdir /data && \
 {% if base == "debian" %}
+    # Force the install of an older MariaDB library to prevent a Diesel panic
+    # See https://github.com/dani-garcia/vaultwarden/issues/6416
+    echo "deb http://snapshot.debian.org/archive/debian/20250707T084701Z/ trixie main" > /etc/apt/sources.list.d/snapshot.list && \
+    echo "Acquire::Check-Valid-Until false;" > etc/apt/apt.conf.d/AllowSnapshot && \
+    echo 'Package: libmariadb libmariadb3 libmariadb-dev mariadb*' > /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin: origin "snapshot.debian.org"' >> /etc/apt/preferences.d/mariadb-snapshot && \
+    echo 'Pin-Priority: 1001' >> /etc/apt/preferences.d/mariadb-snapshot && \
+    # Continue with normal install
     apt-get update && apt-get install -y \
         --no-install-recommends \
         ca-certificates \
         curl \
-        libmariadb-dev-compat \
+        libmariadb3 \
         libpq5 \
         openssl && \
     apt-get clean && \

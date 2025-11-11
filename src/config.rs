@@ -1,5 +1,6 @@
 use std::{
     env::consts::EXE_SUFFIX,
+    fmt,
     process::exit,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -8,16 +9,15 @@ use std::{
 };
 
 use job_scheduler_ng::Schedule;
-use once_cell::sync::Lazy;
 use reqwest::Url;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 
 use crate::{
-    db::DbConnType,
     error::Error,
     util::{get_env, get_env_bool, get_web_vault_version, is_valid_email, parse_experimental_client_feature_flags},
 };
 
-static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
+static CONFIG_FILE: LazyLock<String> = LazyLock::new(|| {
     let data_folder = get_env("DATA_FOLDER").unwrap_or_else(|| String::from("data"));
     get_env("CONFIG_FILE").unwrap_or_else(|| format!("{data_folder}/config.json"))
 });
@@ -34,7 +34,7 @@ static CONFIG_FILENAME: LazyLock<String> = LazyLock::new(|| {
 
 pub static SKIP_CONFIG_VALIDATION: AtomicBool = AtomicBool::new(false);
 
-pub static CONFIG: Lazy<Config> = Lazy::new(|| {
+pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     std::thread::spawn(|| {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|e| {
             println!("Error loading config:\n  {e:?}\n");
@@ -56,6 +56,41 @@ pub static CONFIG: Lazy<Config> = Lazy::new(|| {
 pub type Pass = String;
 
 macro_rules! make_config {
+    // Support string print
+    ( @supportstr $name:ident, $value:expr, Pass, option ) => { serde_json::to_value(&$value.as_ref().map(|_| String::from("***"))).unwrap() }; // Optional pass, we map to an Option<String> with "***"
+    ( @supportstr $name:ident, $value:expr, Pass, $none_action:ident ) => { "***".into() }; // Required pass, we return "***"
+    ( @supportstr $name:ident, $value:expr, $ty:ty, option ) => { serde_json::to_value(&$value).unwrap() }; // Optional other or string, we convert to json
+    ( @supportstr $name:ident, $value:expr, String, $none_action:ident ) => { $value.as_str().into() }; // Required string value, we convert to json
+    ( @supportstr $name:ident, $value:expr, $ty:ty, $none_action:ident ) => { ($value).into() }; // Required other value, we return as is or convert to json
+
+    // Group or empty string
+    ( @show ) => { "" };
+    ( @show $lit:literal ) => { $lit };
+
+    // Wrap the optionals in an Option type
+    ( @type $ty:ty, option) => { Option<$ty> };
+    ( @type $ty:ty, $id:ident) => { $ty };
+
+    // Generate the values depending on none_action
+    ( @build $value:expr, $config:expr, option, ) => { $value };
+    ( @build $value:expr, $config:expr, def, $default:expr ) => { $value.unwrap_or($default) };
+    ( @build $value:expr, $config:expr, auto, $default_fn:expr ) => {{
+        match $value {
+            Some(v) => v,
+            None => {
+                let f: &dyn Fn(&ConfigItems) -> _ = &$default_fn;
+                f($config)
+            }
+        }
+    }};
+    ( @build $value:expr, $config:expr, generated, $default_fn:expr ) => {{
+        let f: &dyn Fn(&ConfigItems) -> _ = &$default_fn;
+        f($config)
+    }};
+
+    ( @getenv $name:expr, bool ) => { get_env_bool($name) };
+    ( @getenv $name:expr, $ty:ident ) => { get_env($name) };
+
     ($(
         $(#[doc = $groupdoc:literal])?
         $group:ident $(: $group_enabled:ident)? {
@@ -75,10 +110,103 @@ macro_rules! make_config {
             _env: ConfigBuilder,
             _usr: ConfigBuilder,
 
-            _overrides: Vec<String>,
+            _overrides: Vec<&'static str>,
         }
 
-        #[derive(Clone, Default, Deserialize, Serialize)]
+        // Custom Deserialize for ConfigBuilder, mainly based upon https://serde.rs/deserialize-struct.html
+        // This deserialize doesn't care if there are keys missing, or if there are duplicate keys
+        // In case of duplicate keys (which should never be possible unless manually edited), the last value is used!
+        // Main reason for this is removing the `visit_seq` function, which causes a lot of code generation not needed or used for this struct.
+        impl<'de> Deserialize<'de> for ConfigBuilder {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                const FIELDS: &[&str] = &[
+                $($(
+                    stringify!($name),
+                )+)+
+                ];
+
+                #[allow(non_camel_case_types)]
+                enum Field {
+                $($(
+                    $name,
+                )+)+
+                    __ignore,
+                }
+
+                impl<'de> Deserialize<'de> for Field {
+                    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                    where
+                        D: Deserializer<'de>,
+                    {
+                        struct FieldVisitor;
+
+                        impl Visitor<'_> for FieldVisitor {
+                            type Value = Field;
+
+                            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                                formatter.write_str("ConfigBuilder field identifier")
+                            }
+
+                            #[inline]
+                            fn visit_str<E>(self, value: &str) -> Result<Field, E>
+                            where
+                                E: de::Error,
+                            {
+                                match value {
+                                $($(
+                                    stringify!($name) => Ok(Field::$name),
+                                )+)+
+                                    _ => Ok(Field::__ignore),
+                                }
+                            }
+                        }
+
+                        deserializer.deserialize_identifier(FieldVisitor)
+                    }
+                }
+
+                struct ConfigBuilderVisitor;
+
+                impl<'de> Visitor<'de> for ConfigBuilderVisitor {
+                    type Value = ConfigBuilder;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("struct ConfigBuilder")
+                    }
+
+                    #[inline]
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        let mut builder = ConfigBuilder::default();
+                        while let Some(key) = map.next_key()? {
+                            match key {
+                            $($(
+                                Field::$name => {
+                                    if builder.$name.is_some() {
+                                        return Err(de::Error::duplicate_field(stringify!($name)));
+                                    }
+                                    builder.$name = map.next_value()?;
+                                }
+                            )+)+
+                                Field::__ignore => {
+                                    let _ = map.next_value::<de::IgnoredAny>()?;
+                                }
+                            }
+                        }
+                        Ok(builder)
+                    }
+                }
+
+                deserializer.deserialize_struct("ConfigBuilder", FIELDS, ConfigBuilderVisitor)
+            }
+        }
+
+        #[derive(Clone, Default, Serialize)]
         pub struct ConfigBuilder {
             $($(
                 #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,7 +215,6 @@ macro_rules! make_config {
         }
 
         impl ConfigBuilder {
-            #[allow(clippy::field_reassign_with_default)]
             fn from_env() -> Self {
                 let env_file = get_env("ENV_FILE").unwrap_or_else(|| String::from(".env"));
                 match dotenvy::from_path(&env_file) {
@@ -149,14 +276,14 @@ macro_rules! make_config {
 
             /// Merges the values of both builders into a new builder.
             /// If both have the same element, `other` wins.
-            fn merge(&self, other: &Self, show_overrides: bool, overrides: &mut Vec<String>) -> Self {
+            fn merge(&self, other: &Self, show_overrides: bool, overrides: &mut Vec<&str>) -> Self {
                 let mut builder = self.clone();
                 $($(
                     if let v @Some(_) = &other.$name {
                         builder.$name = v.clone();
 
                         if self.$name.is_some() {
-                            overrides.push(pastey::paste!(stringify!([<$name:upper>])).into());
+                            overrides.push(pastey::paste!(stringify!([<$name:upper>])));
                         }
                     }
                 )+)+
@@ -175,7 +302,7 @@ macro_rules! make_config {
                 let mut config = ConfigItems::default();
                 let _domain_set = self.domain.is_some();
                 $($(
-                    config.$name = make_config!{ @build self.$name.clone(), &config, $none_action, $($default)? };
+                    config.$name = make_config! { @build self.$name.clone(), &config, $none_action, $($default)? };
                 )+)+
                 config.domain_set = _domain_set;
 
@@ -195,24 +322,51 @@ macro_rules! make_config {
         }
 
         #[derive(Clone, Default)]
-        struct ConfigItems { $($( $name: make_config!{@type $ty, $none_action}, )+)+ }
+        struct ConfigItems { $($( $name: make_config! {@type $ty, $none_action}, )+)+ }
+
+        #[derive(Serialize)]
+        struct ElementDoc {
+            name: &'static str,
+            description: &'static str,
+        }
+
+        #[derive(Serialize)]
+        struct ElementData {
+            editable: bool,
+            name: &'static str,
+            value: serde_json::Value,
+            default: serde_json::Value,
+            #[serde(rename = "type")]
+            r#type: &'static str,
+            doc: ElementDoc,
+            overridden: bool,
+        }
+
+        #[derive(Serialize)]
+        pub struct GroupData {
+            group: &'static str,
+            grouptoggle: &'static str,
+            groupdoc: &'static str,
+            elements: Vec<ElementData>,
+        }
 
         #[allow(unused)]
         impl Config {
             $($(
                 $(#[doc = $doc])+
-                pub fn $name(&self) -> make_config!{@type $ty, $none_action} {
+                pub fn $name(&self) -> make_config! {@type $ty, $none_action} {
                     self.inner.read().unwrap().config.$name.clone()
                 }
             )+)+
 
             pub fn prepare_json(&self) -> serde_json::Value {
                 let (def, cfg, overridden) = {
+                    // Lock the inner as short as possible and clone what is needed to prevent deadlocks
                     let inner = &self.inner.read().unwrap();
                     (inner._env.build(), inner.config.clone(), inner._overrides.clone())
                 };
 
-                fn _get_form_type(rust_type: &str) -> &'static str {
+                fn _get_form_type(rust_type: &'static str) -> &'static str {
                     match rust_type {
                         "Pass" => "password",
                         "String" => "text",
@@ -221,48 +375,36 @@ macro_rules! make_config {
                     }
                 }
 
-                fn _get_doc(doc: &str) -> serde_json::Value {
-                    let mut split = doc.split("|>").map(str::trim);
-
-                    // We do not use the json!() macro here since that causes a lot of macro recursion.
-                    // This slows down compile time and it also causes issues with rust-analyzer
-                    serde_json::Value::Object({
-                        let mut doc_json = serde_json::Map::new();
-                        doc_json.insert("name".into(), serde_json::to_value(split.next()).unwrap());
-                        doc_json.insert("description".into(), serde_json::to_value(split.next()).unwrap());
-                        doc_json
-                    })
+                fn _get_doc(doc_str: &'static str) -> ElementDoc {
+                    let mut split = doc_str.split("|>").map(str::trim);
+                    ElementDoc {
+                        name: split.next().unwrap_or_default(),
+                        description: split.next().unwrap_or_default(),
+                    }
                 }
 
-                // We do not use the json!() macro here since that causes a lot of macro recursion.
-                // This slows down compile time and it also causes issues with rust-analyzer
-                serde_json::Value::Array(<[_]>::into_vec(Box::new([
-                $(
-                    serde_json::Value::Object({
-                        let mut group = serde_json::Map::new();
-                        group.insert("group".into(), (stringify!($group)).into());
-                        group.insert("grouptoggle".into(), (stringify!($($group_enabled)?)).into());
-                        group.insert("groupdoc".into(), (make_config!{ @show $($groupdoc)? }).into());
+                let data: Vec<GroupData> = vec![
+                $( // This repetition is for each group
+                    GroupData {
+                        group: stringify!($group),
+                        grouptoggle: stringify!($($group_enabled)?),
+                        groupdoc: (make_config! { @show $($groupdoc)? }),
 
-                        group.insert("elements".into(), serde_json::Value::Array(<[_]>::into_vec(Box::new([
-                        $(
-                            serde_json::Value::Object({
-                                let mut element = serde_json::Map::new();
-                                element.insert("editable".into(), ($editable).into());
-                                element.insert("name".into(), (stringify!($name)).into());
-                                element.insert("value".into(), serde_json::to_value(cfg.$name).unwrap());
-                                element.insert("default".into(), serde_json::to_value(def.$name).unwrap());
-                                element.insert("type".into(), (_get_form_type(stringify!($ty))).into());
-                                element.insert("doc".into(), (_get_doc(concat!($($doc),+))).into());
-                                element.insert("overridden".into(), (overridden.contains(&pastey::paste!(stringify!([<$name:upper>])).into())).into());
-                                element
-                            }),
-                        )+
-                        ]))));
-                        group
-                    }),
-                )+
-                ])))
+                        elements: vec![
+                        $( // This repetition is for each element within a group
+                            ElementData {
+                                editable: $editable,
+                                name: stringify!($name),
+                                value: serde_json::to_value(&cfg.$name).unwrap_or_default(),
+                                default: serde_json::to_value(&def.$name).unwrap_or_default(),
+                                r#type: _get_form_type(stringify!($ty)),
+                                doc: _get_doc(concat!($($doc),+)),
+                                overridden: overridden.contains(&pastey::paste!(stringify!([<$name:upper>]))),
+                            },
+                        )+], // End of elements repetition
+                    },
+                )+]; // End of groups repetition
+                serde_json::to_value(data).unwrap()
             }
 
             pub fn get_support_json(&self) -> serde_json::Value {
@@ -270,8 +412,8 @@ macro_rules! make_config {
                 // Pass types will always be masked and no need to put them in the list.
                 // Besides Pass, only String types will be masked via _privacy_mask.
                 const PRIVACY_CONFIG: &[&str] = &[
-                    "allowed_iframe_ancestors",
                     "allowed_connect_src",
+                    "allowed_iframe_ancestors",
                     "database_url",
                     "domain_origin",
                     "domain_path",
@@ -279,13 +421,18 @@ macro_rules! make_config {
                     "helo_name",
                     "org_creation_users",
                     "signups_domains_whitelist",
+                    "_smtp_img_src",
+                    "smtp_from_name",
                     "smtp_from",
                     "smtp_host",
                     "smtp_username",
-                    "_smtp_img_src",
+                    "sso_authority",
+                    "sso_callback_path",
+                    "sso_client_id",
                 ];
 
                 let cfg = {
+                    // Lock the inner as short as possible and clone what is needed to prevent deadlocks
                     let inner = &self.inner.read().unwrap();
                     inner.config.clone()
                 };
@@ -315,13 +462,21 @@ macro_rules! make_config {
                 serde_json::Value::Object({
                     let mut json = serde_json::Map::new();
                     $($(
-                        json.insert(stringify!($name).into(), make_config!{ @supportstr $name, cfg.$name, $ty, $none_action });
+                        json.insert(String::from(stringify!($name)), make_config! { @supportstr $name, cfg.$name, $ty, $none_action });
                     )+)+;
+                    // Loop through all privacy sensitive keys and mask them
+                    for mask_key in PRIVACY_CONFIG {
+                        if let Some(value) = json.get_mut(*mask_key) {
+                            if let Some(s) = value.as_str() {
+                                *value = _privacy_mask(s).into();
+                            }
+                        }
+                    }
                     json
                 })
             }
 
-            pub fn get_overrides(&self) -> Vec<String> {
+            pub fn get_overrides(&self) -> Vec<&'static str> {
                 let overrides = {
                     let inner = &self.inner.read().unwrap();
                     inner._overrides.clone()
@@ -330,55 +485,6 @@ macro_rules! make_config {
             }
         }
     };
-
-    // Support string print
-    ( @supportstr $name:ident, $value:expr, Pass, option ) => { serde_json::to_value($value.as_ref().map(|_| String::from("***"))).unwrap() }; // Optional pass, we map to an Option<String> with "***"
-    ( @supportstr $name:ident, $value:expr, Pass, $none_action:ident ) => { "***".into() }; // Required pass, we return "***"
-    ( @supportstr $name:ident, $value:expr, String, option ) => { // Optional other value, we return as is or convert to string to apply the privacy config
-        if PRIVACY_CONFIG.contains(&stringify!($name)) {
-            serde_json::to_value($value.as_ref().map(|x| _privacy_mask(x) )).unwrap()
-        } else {
-            serde_json::to_value($value).unwrap()
-        }
-    };
-    ( @supportstr $name:ident, $value:expr, String, $none_action:ident ) => { // Required other value, we return as is or convert to string to apply the privacy config
-        if PRIVACY_CONFIG.contains(&stringify!($name)) {
-            _privacy_mask(&$value).into()
-        } else {
-            ($value).into()
-        }
-    };
-    ( @supportstr $name:ident, $value:expr, $ty:ty, option ) => { serde_json::to_value($value).unwrap() }; // Optional other value, we return as is or convert to string to apply the privacy config
-    ( @supportstr $name:ident, $value:expr, $ty:ty, $none_action:ident ) => { ($value).into() }; // Required other value, we return as is or convert to string to apply the privacy config
-
-    // Group or empty string
-    ( @show ) => { "" };
-    ( @show $lit:literal ) => { $lit };
-
-    // Wrap the optionals in an Option type
-    ( @type $ty:ty, option) => { Option<$ty> };
-    ( @type $ty:ty, $id:ident) => { $ty };
-
-    // Generate the values depending on none_action
-    ( @build $value:expr, $config:expr, option, ) => { $value };
-    ( @build $value:expr, $config:expr, def, $default:expr ) => { $value.unwrap_or($default) };
-    ( @build $value:expr, $config:expr, auto, $default_fn:expr ) => {{
-        match $value {
-            Some(v) => v,
-            None => {
-                let f: &dyn Fn(&ConfigItems) -> _ = &$default_fn;
-                f($config)
-            }
-        }
-    }};
-    ( @build $value:expr, $config:expr, generated, $default_fn:expr ) => {{
-        let f: &dyn Fn(&ConfigItems) -> _ = &$default_fn;
-        f($config)
-    }};
-
-    ( @getenv $name:expr, bool ) => { get_env_bool($name) };
-    ( @getenv $name:expr, $ty:ident ) => { get_env($name) };
-
 }
 
 //STRUCTURE:
@@ -458,6 +564,9 @@ make_config! {
         /// Duo Auth context cleanup schedule |> Cron schedule of the job that cleans expired Duo contexts from the database. Does nothing if Duo MFA is disabled or set to use the legacy iframe prompt.
         /// Defaults to once every minute. Set blank to disable this job.
         duo_context_purge_schedule:   String, false,  def,    "30 * * * * *".to_string();
+        /// Purge incomplete SSO nonce. |> Cron schedule of the job that cleans leftover nonce in db due to incomplete SSO login.
+        /// Defaults to daily. Set blank to disable this job.
+        purge_incomplete_sso_nonce: String, false,  def,   "0 20 0 * * *".to_string();
     },
 
     /// General settings
@@ -633,8 +742,14 @@ make_config! {
         /// Timeout when acquiring database connection
         database_timeout:       u64,    false,  def,    30;
 
-        /// Database connection pool size
+        /// Timeout in seconds before idle connections to the database are closed
+        database_idle_timeout:  u64,    false, def,     600;
+
+        /// Database connection max pool size
         database_max_conns:     u32,    false,  def,    10;
+
+        /// Database connection min pool size
+        database_min_conns:     u32,    false,  def,    2;
 
         /// Database connection init |> SQL statements to run when creating a new database connection, mainly useful for connection-scoped pragmas. If empty, a database-specific default is used.
         database_conn_init:     String, false,  def,    String::new();
@@ -674,6 +789,42 @@ make_config! {
         /// Bitwarden enforces this by default. In Vaultwarden we encouraged to use multiple organizations because groups were not available.
         /// Setting this to true will enforce the Single Org Policy to be enabled before you can enable the Reset Password policy.
         enforce_single_org_with_reset_pw_policy: bool, false, def, false;
+    },
+
+    /// OpenID Connect SSO settings
+    sso {
+        /// Enabled
+        sso_enabled:                    bool,   true,   def,    false;
+        /// Only SSO login |> Disable Email+Master Password login
+        sso_only:                       bool,   true,   def,    false;
+        /// Allow email association |> Associate existing non-SSO user based on email
+        sso_signups_match_email:        bool,   true,   def,    true;
+        /// Allow unknown email verification status |> Allowing this with `SSO_SIGNUPS_MATCH_EMAIL=true` open potential account takeover.
+        sso_allow_unknown_email_verification: bool, true, def, false;
+        /// Client ID
+        sso_client_id:                  String, true,   def,    String::new();
+        /// Client Key
+        sso_client_secret:              Pass,   true,   def,    String::new();
+        /// Authority Server |> Base url of the OIDC provider discovery endpoint (without `/.well-known/openid-configuration`)
+        sso_authority:                  String, true,   def,    String::new();
+        /// Authorization request scopes |> List the of the needed scope (`openid` is implicit)
+        sso_scopes:                     String, true,  def,   "email profile".to_string();
+        /// Authorization request extra parameters
+        sso_authorize_extra_params:     String, true,  def,    String::new();
+        /// Use PKCE during Authorization flow
+        sso_pkce:                       bool,   true,   def,    true;
+        /// Regex for additional trusted Id token audience |> By default only the client_id is trusted.
+        sso_audience_trusted:           String, true,  option;
+        /// CallBack Path |> Generated from Domain.
+        sso_callback_path:              String, true,  generated, |c| generate_sso_callback_path(&c.domain);
+        /// Optional SSO master password policy |> Ex format: '{"enforceOnLogin":false,"minComplexity":3,"minLength":12,"requireLower":false,"requireNumbers":false,"requireSpecial":false,"requireUpper":false}'
+        sso_master_password_policy:     String, true,  option;
+        /// Use SSO only for auth not the session lifecycle |> Use default Vaultwarden session lifecycle (Idle refresh token valid for 30days)
+        sso_auth_only_not_session:      bool,   true,   def,    false;
+        /// Client cache for discovery endpoint. |> Duration in seconds (0 or less to disable). More details: https://github.com/dani-garcia/vaultwarden/wiki/Enabling-SSO-support-using-OpenId-Connect#client-cache
+        sso_client_cache_expiration:    u64,    true,   def,    0;
+        /// Log all tokens |> `LOG_LEVEL=debug` or `LOG_LEVEL=info,vaultwarden::sso=debug` is required
+        sso_debug_tokens:               bool,   true,   def,    false;
     },
 
     /// Yubikey settings
@@ -734,7 +885,7 @@ make_config! {
         smtp_auth_mechanism:           String, true,   option;
         /// SMTP connection timeout |> Number of seconds when to stop trying to connect to the SMTP server
         smtp_timeout:                  u64,    true,   def,     15;
-        /// Server name sent during HELO |> By default this value should be is on the machine's hostname, but might need to be changed in case it trips some anti-spam filters
+        /// Server name sent during HELO |> By default this value should be the machine's hostname, but might need to be changed in case it trips some anti-spam filters
         helo_name:                     String, true,   option;
         /// Embed images as email attachments.
         smtp_embed_images:             bool, true, def, true;
@@ -767,12 +918,19 @@ make_config! {
 
 fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     // Validate connection URL is valid and DB feature is enabled
-    let url = &cfg.database_url;
-    if DbConnType::from_url(url)? == DbConnType::sqlite && url.contains('/') {
-        let path = std::path::Path::new(&url);
-        if let Some(parent) = path.parent() {
-            if !parent.is_dir() {
-                err!(format!("SQLite database directory `{}` does not exist or is not a directory", parent.display()));
+    #[cfg(sqlite)]
+    {
+        use crate::db::DbConnType;
+        let url = &cfg.database_url;
+        if DbConnType::from_url(url)? == DbConnType::Sqlite && url.contains('/') {
+            let path = std::path::Path::new(&url);
+            if let Some(parent) = path.parent() {
+                if !parent.is_dir() {
+                    err!(format!(
+                        "SQLite database directory `{}` does not exist or is not a directory",
+                        parent.display()
+                    ));
+                }
             }
         }
     }
@@ -784,6 +942,14 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     let limit = 256;
     if cfg.database_max_conns < 1 || cfg.database_max_conns > limit {
         err!(format!("`DATABASE_MAX_CONNS` contains an invalid value. Ensure it is between 1 and {limit}.",));
+    }
+
+    if cfg.database_min_conns < 1 || cfg.database_min_conns > limit {
+        err!(format!("`DATABASE_MIN_CONNS` contains an invalid value. Ensure it is between 1 and {limit}.",));
+    }
+
+    if cfg.database_min_conns > cfg.database_max_conns {
+        err!(format!("`DATABASE_MIN_CONNS` must be smaller than or equal to `DATABASE_MAX_CONNS`.",));
     }
 
     if let Some(log_file) = &cfg.log_file {
@@ -856,10 +1022,10 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         }
     }
 
-    // Server (v2025.5.0): https://github.com/bitwarden/server/blob/4a7db112a0952c6df8bacf36c317e9c4e58c3651/src/Core/Constants.cs#L102
-    // Client (v2025.5.0): https://github.com/bitwarden/clients/blob/9df8a3cc50ed45f52513e62c23fcc8a4b745f078/libs/common/src/enums/feature-flag.enum.ts#L10
-    // Android (v2025.4.0): https://github.com/bitwarden/android/blob/bee09de972c3870de0d54a0067996be473ec55c7/app/src/main/java/com/x8bit/bitwarden/data/platform/manager/model/FlagKey.kt#L27
-    // iOS (v2025.4.0): https://github.com/bitwarden/ios/blob/956e05db67344c912e3a1b8cb2609165d67da1c9/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
+    // Server (v2025.6.2): https://github.com/bitwarden/server/blob/d094be3267f2030bd0dc62106bc6871cf82682f5/src/Core/Constants.cs#L103
+    // Client (web-v2025.6.1): https://github.com/bitwarden/clients/blob/747c2fd6a1c348a57a76e4a7de8128466ffd3c01/libs/common/src/enums/feature-flag.enum.ts#L12
+    // Android (v2025.6.0): https://github.com/bitwarden/android/blob/b5b022caaad33390c31b3021b2c1205925b0e1a2/app/src/main/kotlin/com/x8bit/bitwarden/data/platform/manager/model/FlagKey.kt#L22
+    // iOS (v2025.6.0): https://github.com/bitwarden/ios/blob/ff06d9c6cc8da89f78f37f376495800201d7261a/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
     //
     // NOTE: Move deprecated flags to the utils::parse_experimental_client_feature_flags() DEPRECATED_FLAGS const!
     const KNOWN_FLAGS: &[&str] = &[
@@ -909,6 +1075,16 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         && !(cfg.duo_host.is_some() && cfg.duo_ikey.is_some() && cfg.duo_skey.is_some())
     {
         err!("All Duo options need to be set for global Duo support")
+    }
+
+    if cfg.sso_enabled {
+        if cfg.sso_client_id.is_empty() || cfg.sso_client_secret.is_empty() || cfg.sso_authority.is_empty() {
+            err!("`SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` and `SSO_AUTHORITY` must be set for SSO support")
+        }
+
+        validate_internal_sso_issuer_url(&cfg.sso_authority)?;
+        validate_internal_sso_redirect_url(&cfg.sso_callback_path)?;
+        validate_sso_master_password_policy(&cfg.sso_master_password_policy)?;
     }
 
     if cfg._enable_yubico {
@@ -1088,6 +1264,35 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_internal_sso_issuer_url(sso_authority: &String) -> Result<openidconnect::IssuerUrl, Error> {
+    match openidconnect::IssuerUrl::new(sso_authority.clone()) {
+        Err(err) => err!(format!("Invalid sso_authority URL ({sso_authority}): {err}")),
+        Ok(issuer_url) => Ok(issuer_url),
+    }
+}
+
+fn validate_internal_sso_redirect_url(sso_callback_path: &String) -> Result<openidconnect::RedirectUrl, Error> {
+    match openidconnect::RedirectUrl::new(sso_callback_path.clone()) {
+        Err(err) => err!(format!("Invalid sso_callback_path ({sso_callback_path} built using `domain`) URL: {err}")),
+        Ok(redirect_url) => Ok(redirect_url),
+    }
+}
+
+fn validate_sso_master_password_policy(
+    sso_master_password_policy: &Option<String>,
+) -> Result<Option<serde_json::Value>, Error> {
+    let policy = sso_master_password_policy.as_ref().map(|mpp| serde_json::from_str::<serde_json::Value>(mpp));
+
+    match policy {
+        None => Ok(None),
+        Some(Ok(jsobject @ serde_json::Value::Object(_))) => Ok(Some(jsobject)),
+        Some(Ok(_)) => err!("Invalid sso_master_password_policy: parsed value is not a JSON object"),
+        Some(Err(error)) => {
+            err!(format!("Invalid sso_master_password_policy ({error}), Ensure that it's correctly escaped with ''"))
+        }
+    }
+}
+
 /// Extracts an RFC 6454 web origin from a URL.
 fn extract_url_origin(url: &str) -> String {
     match Url::parse(url) {
@@ -1117,6 +1322,10 @@ fn generate_smtp_img_src(embed_images: bool, domain: &str) -> String {
     } else {
         format!("{domain}/vw_static/")
     }
+}
+
+fn generate_sso_callback_path(domain: &str) -> String {
+    format!("{domain}/identity/connect/oidc-signin")
 }
 
 /// Generate the correct URL for the icon service.
@@ -1188,6 +1397,9 @@ fn opendal_operator_for_path(path: &str) -> Result<opendal::Operator, Error> {
 
 #[cfg(s3)]
 fn opendal_s3_operator_for_path(path: &str) -> Result<opendal::Operator, Error> {
+    use crate::http_client::aws::AwsReqwestConnector;
+    use aws_config::{default_provider::credentials::DefaultCredentialsChain, provider_config::ProviderConfig};
+
     // This is a custom AWS credential loader that uses the official AWS Rust
     // SDK config crate to load credentials. This ensures maximum compatibility
     // with AWS credential configurations. For example, OpenDAL doesn't support
@@ -1200,12 +1412,19 @@ fn opendal_s3_operator_for_path(path: &str) -> Result<opendal::Operator, Error> 
             use aws_credential_types::provider::ProvideCredentials as _;
             use tokio::sync::OnceCell;
 
-            static DEFAULT_CREDENTIAL_CHAIN: OnceCell<
-                aws_config::default_provider::credentials::DefaultCredentialsChain,
-            > = OnceCell::const_new();
+            static DEFAULT_CREDENTIAL_CHAIN: OnceCell<DefaultCredentialsChain> = OnceCell::const_new();
 
             let chain = DEFAULT_CREDENTIAL_CHAIN
-                .get_or_init(|| aws_config::default_provider::credentials::DefaultCredentialsChain::builder().build())
+                .get_or_init(|| {
+                    let reqwest_client = reqwest::Client::builder().build().unwrap();
+                    let connector = AwsReqwestConnector {
+                        client: reqwest_client,
+                    };
+
+                    let conf = ProviderConfig::default().with_http_client(connector);
+
+                    DefaultCredentialsChain::builder().configure(conf).build()
+                })
                 .await;
 
             let creds = chain.provide_credentials().await?;
@@ -1344,6 +1563,16 @@ impl Config {
         }
     }
 
+    // The registration link should be hidden if
+    //  - Signup is not allowed and email whitelist is empty unless mail is disabled and invitations are allowed
+    //  - The SSO is activated and password login is disabled.
+    pub fn is_signup_disabled(&self) -> bool {
+        (!self.signups_allowed()
+            && self.signups_domains_whitelist().is_empty()
+            && (self.mail_enabled() || !self.invitations_allowed()))
+            || (self.sso_enabled() && self.sso_only())
+    }
+
     /// Tests whether the specified user is allowed to create an organization.
     pub fn is_org_creation_allowed(&self, email: &str) -> bool {
         let users = self.org_creation_users();
@@ -1393,7 +1622,7 @@ impl Config {
         if let Some(akey) = self._duo_akey() {
             akey
         } else {
-            let akey_s = crate::crypto::encode_random_bytes::<64>(data_encoding::BASE64);
+            let akey_s = crate::crypto::encode_random_bytes::<64>(&data_encoding::BASE64);
 
             // Save the new value
             let builder = ConfigBuilder {
@@ -1406,6 +1635,10 @@ impl Config {
         }
     }
 
+    pub fn is_webauthn_2fa_supported(&self) -> bool {
+        Url::parse(&self.domain()).expect("DOMAIN not a valid URL").domain().is_some()
+    }
+
     /// Tests whether the admin token is set to a non-empty value.
     pub fn is_admin_token_set(&self) -> bool {
         let token = self.admin_token();
@@ -1413,7 +1646,7 @@ impl Config {
         token.is_some() && !token.unwrap().trim().is_empty()
     }
 
-    pub fn opendal_operator_for_path_type(&self, path_type: PathType) -> Result<opendal::Operator, Error> {
+    pub fn opendal_operator_for_path_type(&self, path_type: &PathType) -> Result<opendal::Operator, Error> {
         let path = match path_type {
             PathType::Data => self.data_folder(),
             PathType::IconCache => self.icon_cache_folder(),
@@ -1456,6 +1689,26 @@ impl Config {
                 handle.notify();
             }
         }
+    }
+
+    pub fn sso_issuer_url(&self) -> Result<openidconnect::IssuerUrl, Error> {
+        validate_internal_sso_issuer_url(&self.sso_authority())
+    }
+
+    pub fn sso_redirect_url(&self) -> Result<openidconnect::RedirectUrl, Error> {
+        validate_internal_sso_redirect_url(&self.sso_callback_path())
+    }
+
+    pub fn sso_master_password_policy_value(&self) -> Option<serde_json::Value> {
+        validate_sso_master_password_policy(&self.sso_master_password_policy()).ok().flatten()
+    }
+
+    pub fn sso_scopes_vec(&self) -> Vec<String> {
+        self.sso_scopes().split_whitespace().map(str::to_string).collect()
+    }
+
+    pub fn sso_authorize_extra_params_vec(&self) -> Vec<(String, String)> {
+        url::form_urlencoded::parse(self.sso_authorize_extra_params().as_bytes()).into_owned().collect()
     }
 }
 
@@ -1500,6 +1753,7 @@ where
 
     reg!("email/admin_reset_password", ".html");
     reg!("email/change_email_existing", ".html");
+    reg!("email/change_email_invited", ".html");
     reg!("email/change_email", ".html");
     reg!("email/delete_account", ".html");
     reg!("email/emergency_access_invite_accepted", ".html");
@@ -1522,6 +1776,7 @@ where
     reg!("email/send_org_invite", ".html");
     reg!("email/send_single_org_removed_from_org", ".html");
     reg!("email/smtp_test", ".html");
+    reg!("email/sso_change_email", ".html");
     reg!("email/twofactor_email", ".html");
     reg!("email/verify_email", ".html");
     reg!("email/welcome_must_verify", ".html");
@@ -1584,7 +1839,7 @@ fn to_json<'reg, 'rc>(
 
 // Configure the web-vault version as an integer so it can be used as a comparison smaller or greater then.
 // The default is based upon the version since this feature is added.
-static WEB_VAULT_VERSION: Lazy<semver::Version> = Lazy::new(|| {
+static WEB_VAULT_VERSION: LazyLock<semver::Version> = LazyLock::new(|| {
     let vault_version = get_web_vault_version();
     // Use a single regex capture to extract version components
     let re = regex::Regex::new(r"(\d{4})\.(\d{1,2})\.(\d{1,2})").unwrap();
@@ -1600,7 +1855,7 @@ static WEB_VAULT_VERSION: Lazy<semver::Version> = Lazy::new(|| {
 
 // Configure the Vaultwarden version as an integer so it can be used as a comparison smaller or greater then.
 // The default is based upon the version since this feature is added.
-static VW_VERSION: Lazy<semver::Version> = Lazy::new(|| {
+static VW_VERSION: LazyLock<semver::Version> = LazyLock::new(|| {
     let vw_version = crate::VERSION.unwrap_or("1.32.5");
     // Use a single regex capture to extract version components
     let re = regex::Regex::new(r"(\d{1})\.(\d{1,2})\.(\d{1,2})").unwrap();
