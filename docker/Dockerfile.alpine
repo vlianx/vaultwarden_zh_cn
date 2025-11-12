@@ -19,23 +19,23 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull docker.io/vaultwarden/web-vault:v2025.10.1
-#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2025.10.1
-#     [docker.io/vaultwarden/web-vault@sha256:50662dccf4908ac2128cd44981c52fcb4e3e8dd56f21823c8d5e91267ff741fa]
+#     $ docker pull docker.io/vaultwarden/web-vault:v2025.7.0
+#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2025.7.0
+#     [docker.io/vaultwarden/web-vault@sha256:f6ac819a2cd9e226f2cd2ec26196ede94a41e672e9672a11b5f307a19278b15e]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:50662dccf4908ac2128cd44981c52fcb4e3e8dd56f21823c8d5e91267ff741fa
-#     [docker.io/vaultwarden/web-vault:v2025.10.1]
+#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:f6ac819a2cd9e226f2cd2ec26196ede94a41e672e9672a11b5f307a19278b15e
+#     [docker.io/vaultwarden/web-vault:v2025.7.0]
 #
-FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:50662dccf4908ac2128cd44981c52fcb4e3e8dd56f21823c8d5e91267ff741fa AS vault
+FROM --platform=linux/amd64 docker.io/vaultwarden/web-vault@sha256:f6ac819a2cd9e226f2cd2ec26196ede94a41e672e9672a11b5f307a19278b15e AS vault
 
 ########################## ALPINE BUILD IMAGES ##########################
 ## NOTE: The Alpine Base Images do not support other platforms then linux/amd64
 ## And for Alpine we define all build images here, they will only be loaded when actually used
-FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:x86_64-musl-stable-1.91.0 AS build_amd64
-FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:aarch64-musl-stable-1.91.0 AS build_arm64
-FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:armv7-musleabihf-stable-1.91.0 AS build_armv7
-FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:arm-musleabi-stable-1.91.0 AS build_armv6
+FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:x86_64-musl-stable-1.88.0 AS build_amd64
+FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:aarch64-musl-stable-1.88.0 AS build_arm64
+FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:armv7-musleabihf-stable-1.88.0 AS build_armv7
+FROM --platform=linux/amd64 ghcr.io/blackdex/rust-musl:arm-musleabi-stable-1.88.0 AS build_armv6
 
 ########################## BUILD IMAGE ##########################
 # hadolint ignore=DL3006
@@ -53,9 +53,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TERM=xterm-256color \
     CARGO_HOME="/root/.cargo" \
     USER="root" \
-    # Use PostgreSQL v17 during Alpine/MUSL builds instead of the default v16
-    # Debian Trixie uses libpq v17
-    PQ_LIB_DIR="/usr/local/musl/pq17/lib"
+    # Use PostgreSQL v15 during Alpine/MUSL builds instead of the default v11
+    # Debian Bookworm already contains libpq v15
+    PQ_LIB_DIR="/usr/local/musl/pq15/lib"
 
 
 # Create CARGO_HOME folder and don't download rust docs
@@ -131,7 +131,7 @@ FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.22
 
 ENV ROCKET_PROFILE="release" \
     ROCKET_ADDRESS=0.0.0.0 \
-    ROCKET_PORT=30002 \
+    ROCKET_PORT=80 \
     SSL_CERT_DIR=/etc/ssl/certs
 
 # Create data folder and Install needed libraries
@@ -143,7 +143,7 @@ RUN mkdir /data && \
         tzdata
 
 VOLUME /data
-EXPOSE 30002
+EXPOSE 80
 
 # Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage

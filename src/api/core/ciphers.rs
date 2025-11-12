@@ -17,14 +17,7 @@ use crate::{
     auth::Headers,
     config::PathType,
     crypto,
-    db::{
-        models::{
-            Attachment, AttachmentId, Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId,
-            CollectionUser, EventType, Favorite, Folder, FolderCipher, FolderId, Group, Membership, MembershipType,
-            OrgPolicy, OrgPolicyType, OrganizationId, RepromptType, Send, UserId,
-        },
-        DbConn, DbPool,
-    },
+    db::{models::*, DbConn, DbPool},
     CONFIG,
 };
 
@@ -85,7 +78,6 @@ pub fn routes() -> Vec<Route> {
         restore_cipher_put,
         restore_cipher_put_admin,
         restore_cipher_selected,
-        restore_cipher_selected_admin,
         delete_all,
         move_cipher_selected,
         move_cipher_selected_put,
@@ -100,8 +92,8 @@ pub fn routes() -> Vec<Route> {
 
 pub async fn purge_trashed_ciphers(pool: DbPool) {
     debug!("Purging trashed ciphers");
-    if let Ok(conn) = pool.get().await {
-        Cipher::purge_trash(&conn).await;
+    if let Ok(mut conn) = pool.get().await {
+        Cipher::purge_trash(&mut conn).await;
     } else {
         error!("Failed to get DB connection while purging trashed ciphers")
     }
@@ -114,11 +106,11 @@ struct SyncData {
 }
 
 #[get("/sync?<data..>")]
-async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVersion>, conn: DbConn) -> JsonResult {
-    let user_json = headers.user.to_json(&conn).await;
+async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVersion>, mut conn: DbConn) -> JsonResult {
+    let user_json = headers.user.to_json(&mut conn).await;
 
     // Get all ciphers which are visible by the user
-    let mut ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &conn).await;
+    let mut ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &mut conn).await;
 
     // Filter out SSH keys if the client version is less than 2024.12.0
     let show_ssh_keys = if let Some(client_version) = client_version {
@@ -131,30 +123,31 @@ async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVer
         ciphers.retain(|c| c.atype != 5);
     }
 
-    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &conn).await;
+    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &mut conn).await;
 
     // Lets generate the ciphers_json using all the gathered info
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
     for c in ciphers {
         ciphers_json.push(
-            c.to_json(&headers.host, &headers.user.uuid, Some(&cipher_sync_data), CipherSyncType::User, &conn).await?,
+            c.to_json(&headers.host, &headers.user.uuid, Some(&cipher_sync_data), CipherSyncType::User, &mut conn)
+                .await?,
         );
     }
 
-    let collections = Collection::find_by_user_uuid(headers.user.uuid.clone(), &conn).await;
+    let collections = Collection::find_by_user_uuid(headers.user.uuid.clone(), &mut conn).await;
     let mut collections_json = Vec::with_capacity(collections.len());
     for c in collections {
-        collections_json.push(c.to_json_details(&headers.user.uuid, Some(&cipher_sync_data), &conn).await);
+        collections_json.push(c.to_json_details(&headers.user.uuid, Some(&cipher_sync_data), &mut conn).await);
     }
 
     let folders_json: Vec<Value> =
-        Folder::find_by_user(&headers.user.uuid, &conn).await.iter().map(Folder::to_json).collect();
+        Folder::find_by_user(&headers.user.uuid, &mut conn).await.iter().map(Folder::to_json).collect();
 
     let sends_json: Vec<Value> =
-        Send::find_by_user(&headers.user.uuid, &conn).await.iter().map(Send::to_json).collect();
+        Send::find_by_user(&headers.user.uuid, &mut conn).await.iter().map(Send::to_json).collect();
 
     let policies_json: Vec<Value> =
-        OrgPolicy::find_confirmed_by_user(&headers.user.uuid, &conn).await.iter().map(OrgPolicy::to_json).collect();
+        OrgPolicy::find_confirmed_by_user(&headers.user.uuid, &mut conn).await.iter().map(OrgPolicy::to_json).collect();
 
     let domains_json = if data.exclude_domains {
         Value::Null
@@ -175,14 +168,15 @@ async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVer
 }
 
 #[get("/ciphers")]
-async fn get_ciphers(headers: Headers, conn: DbConn) -> JsonResult {
-    let ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &conn).await;
-    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &conn).await;
+async fn get_ciphers(headers: Headers, mut conn: DbConn) -> JsonResult {
+    let ciphers = Cipher::find_by_user_visible(&headers.user.uuid, &mut conn).await;
+    let cipher_sync_data = CipherSyncData::new(&headers.user.uuid, CipherSyncType::User, &mut conn).await;
 
     let mut ciphers_json = Vec::with_capacity(ciphers.len());
     for c in ciphers {
         ciphers_json.push(
-            c.to_json(&headers.host, &headers.user.uuid, Some(&cipher_sync_data), CipherSyncType::User, &conn).await?,
+            c.to_json(&headers.host, &headers.user.uuid, Some(&cipher_sync_data), CipherSyncType::User, &mut conn)
+                .await?,
         );
     }
 
@@ -194,16 +188,16 @@ async fn get_ciphers(headers: Headers, conn: DbConn) -> JsonResult {
 }
 
 #[get("/ciphers/<cipher_id>")]
-async fn get_cipher(cipher_id: CipherId, headers: Headers, conn: DbConn) -> JsonResult {
-    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+async fn get_cipher(cipher_id: CipherId, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_accessible_to_user(&headers.user.uuid, &conn).await {
+    if !cipher.is_accessible_to_user(&headers.user.uuid, &mut conn).await {
         err!("Cipher is not owned by user")
     }
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await?))
 }
 
 #[get("/ciphers/<cipher_id>/admin")]
@@ -296,7 +290,7 @@ async fn post_ciphers_admin(data: Json<ShareCipherData>, headers: Headers, conn:
 async fn post_ciphers_create(
     data: Json<ShareCipherData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
     let mut data: ShareCipherData = data.into_inner();
@@ -310,11 +304,11 @@ async fn post_ciphers_create(
     // This check is usually only needed in update_cipher_from_data(), but we
     // need it here as well to avoid creating an empty cipher in the call to
     // cipher.save() below.
-    enforce_personal_ownership_policy(Some(&data.cipher), &headers, &conn).await?;
+    enforce_personal_ownership_policy(Some(&data.cipher), &headers, &mut conn).await?;
 
     let mut cipher = Cipher::new(data.cipher.r#type, data.cipher.name.clone());
     cipher.user_uuid = Some(headers.user.uuid.clone());
-    cipher.save(&conn).await?;
+    cipher.save(&mut conn).await?;
 
     // When cloning a cipher, the Bitwarden clients seem to set this field
     // based on the cipher being cloned (when creating a new cipher, it's set
@@ -324,12 +318,12 @@ async fn post_ciphers_create(
     // or otherwise), we can just ignore this field entirely.
     data.cipher.last_known_revision_date = None;
 
-    share_cipher_by_uuid(&cipher.uuid, data, &headers, &conn, &nt, None).await
+    share_cipher_by_uuid(&cipher.uuid, data, &headers, &mut conn, &nt).await
 }
 
 /// Called when creating a new user-owned cipher.
 #[post("/ciphers", data = "<data>")]
-async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
+async fn post_ciphers(data: Json<CipherData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> JsonResult {
     let mut data: CipherData = data.into_inner();
 
     // The web/browser clients set this field to null as expected, but the
@@ -339,9 +333,9 @@ async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt
     data.last_known_revision_date = None;
 
     let mut cipher = Cipher::new(data.r#type, data.name.clone());
-    update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherCreate).await?;
+    update_cipher_from_data(&mut cipher, data, &headers, None, &mut conn, &nt, UpdateType::SyncCipherCreate).await?;
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await?))
 }
 
 /// Enforces the personal ownership policy on user-owned ciphers, if applicable.
@@ -351,7 +345,11 @@ async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt
 /// allowed to delete or share such ciphers to an org, however.
 ///
 /// Ref: https://bitwarden.com/help/article/policies/#personal-ownership
-async fn enforce_personal_ownership_policy(data: Option<&CipherData>, headers: &Headers, conn: &DbConn) -> EmptyResult {
+async fn enforce_personal_ownership_policy(
+    data: Option<&CipherData>,
+    headers: &Headers,
+    conn: &mut DbConn,
+) -> EmptyResult {
     if data.is_none() || data.unwrap().organization_id.is_none() {
         let user_id = &headers.user.uuid;
         let policy_type = OrgPolicyType::PersonalOwnership;
@@ -367,7 +365,7 @@ pub async fn update_cipher_from_data(
     data: CipherData,
     headers: &Headers,
     shared_to_collections: Option<Vec<CollectionId>>,
-    conn: &DbConn,
+    conn: &mut DbConn,
     nt: &Notify<'_>,
     ut: UpdateType,
 ) -> EmptyResult {
@@ -560,8 +558,13 @@ struct RelationsData {
 }
 
 #[post("/ciphers/import", data = "<data>")]
-async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    enforce_personal_ownership_policy(None, &headers, &conn).await?;
+async fn post_ciphers_import(
+    data: Json<ImportData>,
+    headers: Headers,
+    mut conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    enforce_personal_ownership_policy(None, &headers, &mut conn).await?;
 
     let data: ImportData = data.into_inner();
 
@@ -573,14 +576,14 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
 
     // Read and create the folders
     let existing_folders: HashSet<Option<FolderId>> =
-        Folder::find_by_user(&headers.user.uuid, &conn).await.into_iter().map(|f| Some(f.uuid)).collect();
+        Folder::find_by_user(&headers.user.uuid, &mut conn).await.into_iter().map(|f| Some(f.uuid)).collect();
     let mut folders: Vec<FolderId> = Vec::with_capacity(data.folders.len());
     for folder in data.folders.into_iter() {
         let folder_id = if existing_folders.contains(&folder.id) {
             folder.id.unwrap()
         } else {
             let mut new_folder = Folder::new(headers.user.uuid.clone(), folder.name);
-            new_folder.save(&conn).await?;
+            new_folder.save(&mut conn).await?;
             new_folder.uuid
         };
 
@@ -600,12 +603,12 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
         cipher_data.folder_id = folder_id;
 
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &mut conn, &nt, UpdateType::None).await?;
     }
 
     let mut user = headers.user;
-    user.update_revision(&conn).await?;
-    nt.send_user_update(UpdateType::SyncVault, &user, &headers.device.push_uuid, &conn).await;
+    user.update_revision(&mut conn).await?;
+    nt.send_user_update(UpdateType::SyncVault, &user, &headers.device.push_uuid, &mut conn).await;
 
     Ok(())
 }
@@ -649,12 +652,12 @@ async fn put_cipher(
     cipher_id: CipherId,
     data: Json<CipherData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
     let data: CipherData = data.into_inner();
 
-    let Some(mut cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+    let Some(mut cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
@@ -663,13 +666,13 @@ async fn put_cipher(
     // cipher itself, so the user shouldn't need write access to change these.
     // Interestingly, upstream Bitwarden doesn't properly handle this either.
 
-    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await {
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &mut conn).await {
         err!("Cipher is not write accessible")
     }
 
-    update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherUpdate).await?;
+    update_cipher_from_data(&mut cipher, data, &headers, None, &mut conn, &nt, UpdateType::SyncCipherUpdate).await?;
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await?))
 }
 
 #[post("/ciphers/<cipher_id>/partial", data = "<data>")]
@@ -688,26 +691,26 @@ async fn put_cipher_partial(
     cipher_id: CipherId,
     data: Json<PartialCipherData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
 ) -> JsonResult {
     let data: PartialCipherData = data.into_inner();
 
-    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
     if let Some(ref folder_id) = data.folder_id {
-        if Folder::find_by_uuid_and_user(folder_id, &headers.user.uuid, &conn).await.is_none() {
+        if Folder::find_by_uuid_and_user(folder_id, &headers.user.uuid, &mut conn).await.is_none() {
             err!("Invalid folder", "Folder does not exist or belongs to another user");
         }
     }
 
     // Move cipher
-    cipher.move_to_folder(data.folder_id.clone(), &headers.user.uuid, &conn).await?;
+    cipher.move_to_folder(data.folder_id.clone(), &headers.user.uuid, &mut conn).await?;
     // Update favorite
-    cipher.set_favorite(Some(data.favorite), &headers.user.uuid, &conn).await?;
+    cipher.set_favorite(Some(data.favorite), &headers.user.uuid, &mut conn).await?;
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await?))
 }
 
 #[derive(Deserialize)]
@@ -760,34 +763,35 @@ async fn post_collections_update(
     cipher_id: CipherId,
     data: Json<CollectionsAdminData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
     let data: CollectionsAdminData = data.into_inner();
 
-    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_in_editable_collection_by_user(&headers.user.uuid, &conn).await {
-        err!("Collection cannot be changed")
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &mut conn).await {
+        err!("Cipher is not write accessible")
     }
 
     let posted_collections = HashSet::<CollectionId>::from_iter(data.collection_ids);
     let current_collections =
-        HashSet::<CollectionId>::from_iter(cipher.get_collections(headers.user.uuid.clone(), &conn).await);
+        HashSet::<CollectionId>::from_iter(cipher.get_collections(headers.user.uuid.clone(), &mut conn).await);
 
     for collection in posted_collections.symmetric_difference(&current_collections) {
-        match Collection::find_by_uuid_and_org(collection, cipher.organization_uuid.as_ref().unwrap(), &conn).await {
+        match Collection::find_by_uuid_and_org(collection, cipher.organization_uuid.as_ref().unwrap(), &mut conn).await
+        {
             None => err!("Invalid collection ID provided"),
             Some(collection) => {
-                if collection.is_writable_by_user(&headers.user.uuid, &conn).await {
+                if collection.is_writable_by_user(&headers.user.uuid, &mut conn).await {
                     if posted_collections.contains(&collection.uuid) {
                         // Add to collection
-                        CollectionCipher::save(&cipher.uuid, &collection.uuid, &conn).await?;
+                        CollectionCipher::save(&cipher.uuid, &collection.uuid, &mut conn).await?;
                     } else {
                         // Remove from collection
-                        CollectionCipher::delete(&cipher.uuid, &collection.uuid, &conn).await?;
+                        CollectionCipher::delete(&cipher.uuid, &collection.uuid, &mut conn).await?;
                     }
                 } else {
                     err!("No rights to modify the collection")
@@ -799,10 +803,10 @@ async fn post_collections_update(
     nt.send_cipher_update(
         UpdateType::SyncCipherUpdate,
         &cipher,
-        &cipher.update_users_revision(&conn).await,
+        &cipher.update_users_revision(&mut conn).await,
         &headers.device,
         Some(Vec::from_iter(posted_collections)),
-        &conn,
+        &mut conn,
     )
     .await;
 
@@ -813,11 +817,11 @@ async fn post_collections_update(
         &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
-        &conn,
+        &mut conn,
     )
     .await;
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await?))
 }
 
 #[put("/ciphers/<cipher_id>/collections-admin", data = "<data>")]
@@ -836,34 +840,35 @@ async fn post_collections_admin(
     cipher_id: CipherId,
     data: Json<CollectionsAdminData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
     let data: CollectionsAdminData = data.into_inner();
 
-    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_in_editable_collection_by_user(&headers.user.uuid, &conn).await {
-        err!("Collection cannot be changed")
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &mut conn).await {
+        err!("Cipher is not write accessible")
     }
 
     let posted_collections = HashSet::<CollectionId>::from_iter(data.collection_ids);
     let current_collections =
-        HashSet::<CollectionId>::from_iter(cipher.get_admin_collections(headers.user.uuid.clone(), &conn).await);
+        HashSet::<CollectionId>::from_iter(cipher.get_admin_collections(headers.user.uuid.clone(), &mut conn).await);
 
     for collection in posted_collections.symmetric_difference(&current_collections) {
-        match Collection::find_by_uuid_and_org(collection, cipher.organization_uuid.as_ref().unwrap(), &conn).await {
+        match Collection::find_by_uuid_and_org(collection, cipher.organization_uuid.as_ref().unwrap(), &mut conn).await
+        {
             None => err!("Invalid collection ID provided"),
             Some(collection) => {
-                if collection.is_writable_by_user(&headers.user.uuid, &conn).await {
+                if collection.is_writable_by_user(&headers.user.uuid, &mut conn).await {
                     if posted_collections.contains(&collection.uuid) {
                         // Add to collection
-                        CollectionCipher::save(&cipher.uuid, &collection.uuid, &conn).await?;
+                        CollectionCipher::save(&cipher.uuid, &collection.uuid, &mut conn).await?;
                     } else {
                         // Remove from collection
-                        CollectionCipher::delete(&cipher.uuid, &collection.uuid, &conn).await?;
+                        CollectionCipher::delete(&cipher.uuid, &collection.uuid, &mut conn).await?;
                     }
                 } else {
                     err!("No rights to modify the collection")
@@ -875,10 +880,10 @@ async fn post_collections_admin(
     nt.send_cipher_update(
         UpdateType::SyncCipherUpdate,
         &cipher,
-        &cipher.update_users_revision(&conn).await,
+        &cipher.update_users_revision(&mut conn).await,
         &headers.device,
         Some(Vec::from_iter(posted_collections)),
-        &conn,
+        &mut conn,
     )
     .await;
 
@@ -889,7 +894,7 @@ async fn post_collections_admin(
         &headers.user.uuid,
         headers.device.atype,
         &headers.ip.ip,
-        &conn,
+        &mut conn,
     )
     .await;
 
@@ -910,12 +915,12 @@ async fn post_cipher_share(
     cipher_id: CipherId,
     data: Json<ShareCipherData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
     let data: ShareCipherData = data.into_inner();
 
-    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None).await
+    share_cipher_by_uuid(&cipher_id, data, &headers, &mut conn, &nt).await
 }
 
 #[put("/ciphers/<cipher_id>/share", data = "<data>")]
@@ -923,12 +928,12 @@ async fn put_cipher_share(
     cipher_id: CipherId,
     data: Json<ShareCipherData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
     let data: ShareCipherData = data.into_inner();
 
-    share_cipher_by_uuid(&cipher_id, data, &headers, &conn, &nt, None).await
+    share_cipher_by_uuid(&cipher_id, data, &headers, &mut conn, &nt).await
 }
 
 #[derive(Deserialize)]
@@ -942,7 +947,7 @@ struct ShareSelectedCipherData {
 async fn put_cipher_share_selected(
     data: Json<ShareSelectedCipherData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
     let mut data: ShareSelectedCipherData = data.into_inner();
@@ -968,15 +973,10 @@ async fn put_cipher_share_selected(
         };
 
         match shared_cipher_data.cipher.id.take() {
-            Some(id) => {
-                share_cipher_by_uuid(&id, shared_cipher_data, &headers, &conn, &nt, Some(UpdateType::None)).await?
-            }
+            Some(id) => share_cipher_by_uuid(&id, shared_cipher_data, &headers, &mut conn, &nt).await?,
             None => err!("Request missing ids field"),
         };
     }
-
-    // Multi share actions do not send out a push for each cipher, we need to send a general sync here
-    nt.send_user_update(UpdateType::SyncCiphers, &headers.user, &headers.device.push_uuid, &conn).await;
 
     Ok(())
 }
@@ -985,9 +985,8 @@ async fn share_cipher_by_uuid(
     cipher_id: &CipherId,
     data: ShareCipherData,
     headers: &Headers,
-    conn: &DbConn,
+    conn: &mut DbConn,
     nt: &Notify<'_>,
-    override_ut: Option<UpdateType>,
 ) -> JsonResult {
     let mut cipher = match Cipher::find_by_uuid(cipher_id, conn).await {
         Some(cipher) => {
@@ -1019,10 +1018,7 @@ async fn share_cipher_by_uuid(
     };
 
     // When LastKnownRevisionDate is None, it is a new cipher, so send CipherCreate.
-    // If there is an override, like when handling multiple items, we want to prevent a push notification for every single item
-    let ut = if let Some(ut) = override_ut {
-        ut
-    } else if data.cipher.last_known_revision_date.is_some() {
+    let ut = if data.cipher.last_known_revision_date.is_some() {
         UpdateType::SyncCipherUpdate
     } else {
         UpdateType::SyncCipherCreate
@@ -1044,17 +1040,17 @@ async fn get_attachment(
     cipher_id: CipherId,
     attachment_id: AttachmentId,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
 ) -> JsonResult {
-    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_accessible_to_user(&headers.user.uuid, &conn).await {
+    if !cipher.is_accessible_to_user(&headers.user.uuid, &mut conn).await {
         err!("Cipher is not accessible")
     }
 
-    match Attachment::find_by_id(&attachment_id, &conn).await {
+    match Attachment::find_by_id(&attachment_id, &mut conn).await {
         Some(attachment) if cipher_id == attachment.cipher_uuid => Ok(Json(attachment.to_json(&headers.host).await?)),
         Some(_) => err!("Attachment doesn't belong to cipher"),
         None => err!("Attachment doesn't exist"),
@@ -1084,13 +1080,13 @@ async fn post_attachment_v2(
     cipher_id: CipherId,
     data: Json<AttachmentRequestData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
 ) -> JsonResult {
-    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await {
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &mut conn).await {
         err!("Cipher is not write accessible")
     }
 
@@ -1103,7 +1099,7 @@ async fn post_attachment_v2(
     let attachment_id = crypto::generate_attachment_id();
     let attachment =
         Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key));
-    attachment.save(&conn).await.expect("Error saving attachment");
+    attachment.save(&mut conn).await.expect("Error saving attachment");
 
     let url = format!("/ciphers/{}/attachment/{attachment_id}", cipher.uuid);
     let response_key = match data.admin_request {
@@ -1116,7 +1112,7 @@ async fn post_attachment_v2(
         "attachmentId": attachment_id,
         "url": url,
         "fileUploadType": FileUploadType::Direct as i32,
-        response_key: cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?,
+        response_key: cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await?,
     })))
 }
 
@@ -1139,7 +1135,7 @@ async fn save_attachment(
     cipher_id: CipherId,
     data: Form<UploadData<'_>>,
     headers: &Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> Result<(Cipher, DbConn), crate::error::Error> {
     let data = data.into_inner();
@@ -1151,11 +1147,11 @@ async fn save_attachment(
         err!("Attachment size can't be negative")
     }
 
-    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
+    let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
         err!("Cipher doesn't exist")
     };
 
-    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await {
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &mut conn).await {
         err!("Cipher is not write accessible")
     }
 
@@ -1170,7 +1166,7 @@ async fn save_attachment(
         match CONFIG.user_attachment_limit() {
             Some(0) => err!("Attachments are disabled"),
             Some(limit_kb) => {
-                let already_used = Attachment::size_by_user(user_id, &conn).await;
+                let already_used = Attachment::size_by_user(user_id, &mut conn).await;
                 let left = limit_kb
                     .checked_mul(1024)
                     .and_then(|l| l.checked_sub(already_used))
@@ -1192,7 +1188,7 @@ async fn save_attachment(
         match CONFIG.org_attachment_limit() {
             Some(0) => err!("Attachments are disabled"),
             Some(limit_kb) => {
-                let already_used = Attachment::size_by_org(org_id, &conn).await;
+                let already_used = Attachment::size_by_org(org_id, &mut conn).await;
                 let left = limit_kb
                     .checked_mul(1024)
                     .and_then(|l| l.checked_sub(already_used))
@@ -1243,10 +1239,10 @@ async fn save_attachment(
             if size != attachment.file_size {
                 // Update the attachment with the actual file size.
                 attachment.file_size = size;
-                attachment.save(&conn).await.expect("Error updating attachment");
+                attachment.save(&mut conn).await.expect("Error updating attachment");
             }
         } else {
-            attachment.delete(&conn).await.ok();
+            attachment.delete(&mut conn).await.ok();
 
             err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
         }
@@ -1266,18 +1262,18 @@ async fn save_attachment(
         }
         let attachment =
             Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key);
-        attachment.save(&conn).await.expect("Error saving attachment");
+        attachment.save(&mut conn).await.expect("Error saving attachment");
     }
 
-    save_temp_file(&PathType::Attachments, &format!("{cipher_id}/{file_id}"), data.data, true).await?;
+    save_temp_file(PathType::Attachments, &format!("{cipher_id}/{file_id}"), data.data, true).await?;
 
     nt.send_cipher_update(
         UpdateType::SyncCipherUpdate,
         &cipher,
-        &cipher.update_users_revision(&conn).await,
+        &cipher.update_users_revision(&mut conn).await,
         &headers.device,
         None,
-        &conn,
+        &mut conn,
     )
     .await;
 
@@ -1289,7 +1285,7 @@ async fn save_attachment(
             &headers.user.uuid,
             headers.device.atype,
             &headers.ip.ip,
-            &conn,
+            &mut conn,
         )
         .await;
     }
@@ -1307,10 +1303,10 @@ async fn post_attachment_v2_data(
     attachment_id: AttachmentId,
     data: Form<UploadData<'_>>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    let attachment = match Attachment::find_by_id(&attachment_id, &conn).await {
+    let attachment = match Attachment::find_by_id(&attachment_id, &mut conn).await {
         Some(attachment) if cipher_id == attachment.cipher_uuid => Some(attachment),
         Some(_) => err!("Attachment doesn't belong to cipher"),
         None => err!("Attachment doesn't exist"),
@@ -1334,9 +1330,9 @@ async fn post_attachment(
     // the attachment database record as well as saving the data to disk.
     let attachment = None;
 
-    let (cipher, conn) = save_attachment(attachment, cipher_id, data, &headers, conn, nt).await?;
+    let (cipher, mut conn) = save_attachment(attachment, cipher_id, data, &headers, conn, nt).await?;
 
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &mut conn).await?))
 }
 
 #[post("/ciphers/<cipher_id>/attachment-admin", format = "multipart/form-data", data = "<data>")]
@@ -1356,10 +1352,10 @@ async fn post_attachment_share(
     attachment_id: AttachmentId,
     data: Form<UploadData<'_>>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
-    _delete_cipher_attachment_by_id(&cipher_id, &attachment_id, &headers, &conn, &nt).await?;
+    _delete_cipher_attachment_by_id(&cipher_id, &attachment_id, &headers, &mut conn, &nt).await?;
     post_attachment(cipher_id, data, headers, conn, nt).await
 }
 
@@ -1390,10 +1386,10 @@ async fn delete_attachment(
     cipher_id: CipherId,
     attachment_id: AttachmentId,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
-    _delete_cipher_attachment_by_id(&cipher_id, &attachment_id, &headers, &conn, &nt).await
+    _delete_cipher_attachment_by_id(&cipher_id, &attachment_id, &headers, &mut conn, &nt).await
 }
 
 #[delete("/ciphers/<cipher_id>/attachment/<attachment_id>/admin")]
@@ -1401,45 +1397,54 @@ async fn delete_attachment_admin(
     cipher_id: CipherId,
     attachment_id: AttachmentId,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
-    _delete_cipher_attachment_by_id(&cipher_id, &attachment_id, &headers, &conn, &nt).await
+    _delete_cipher_attachment_by_id(&cipher_id, &attachment_id, &headers, &mut conn, &nt).await
 }
 
 #[post("/ciphers/<cipher_id>/delete")]
-async fn delete_cipher_post(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    _delete_cipher_by_uuid(&cipher_id, &headers, &conn, &CipherDeleteOptions::HardSingle, &nt).await
+async fn delete_cipher_post(cipher_id: CipherId, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    _delete_cipher_by_uuid(&cipher_id, &headers, &mut conn, false, &nt).await
     // permanent delete
 }
 
 #[post("/ciphers/<cipher_id>/delete-admin")]
-async fn delete_cipher_post_admin(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    _delete_cipher_by_uuid(&cipher_id, &headers, &conn, &CipherDeleteOptions::HardSingle, &nt).await
+async fn delete_cipher_post_admin(
+    cipher_id: CipherId,
+    headers: Headers,
+    mut conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    _delete_cipher_by_uuid(&cipher_id, &headers, &mut conn, false, &nt).await
     // permanent delete
 }
 
 #[put("/ciphers/<cipher_id>/delete")]
-async fn delete_cipher_put(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    _delete_cipher_by_uuid(&cipher_id, &headers, &conn, &CipherDeleteOptions::SoftSingle, &nt).await
+async fn delete_cipher_put(cipher_id: CipherId, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    _delete_cipher_by_uuid(&cipher_id, &headers, &mut conn, true, &nt).await
     // soft delete
 }
 
 #[put("/ciphers/<cipher_id>/delete-admin")]
-async fn delete_cipher_put_admin(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    _delete_cipher_by_uuid(&cipher_id, &headers, &conn, &CipherDeleteOptions::SoftSingle, &nt).await
-    // soft delete
+async fn delete_cipher_put_admin(
+    cipher_id: CipherId,
+    headers: Headers,
+    mut conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    _delete_cipher_by_uuid(&cipher_id, &headers, &mut conn, true, &nt).await
 }
 
 #[delete("/ciphers/<cipher_id>")]
-async fn delete_cipher(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    _delete_cipher_by_uuid(&cipher_id, &headers, &conn, &CipherDeleteOptions::HardSingle, &nt).await
+async fn delete_cipher(cipher_id: CipherId, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    _delete_cipher_by_uuid(&cipher_id, &headers, &mut conn, false, &nt).await
     // permanent delete
 }
 
 #[delete("/ciphers/<cipher_id>/admin")]
-async fn delete_cipher_admin(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    _delete_cipher_by_uuid(&cipher_id, &headers, &conn, &CipherDeleteOptions::HardSingle, &nt).await
+async fn delete_cipher_admin(cipher_id: CipherId, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    _delete_cipher_by_uuid(&cipher_id, &headers, &mut conn, false, &nt).await
     // permanent delete
 }
 
@@ -1450,8 +1455,7 @@ async fn delete_cipher_selected(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    _delete_multiple_ciphers(data, headers, conn, CipherDeleteOptions::HardMulti, nt).await
-    // permanent delete
+    _delete_multiple_ciphers(data, headers, conn, false, nt).await // permanent delete
 }
 
 #[post("/ciphers/delete", data = "<data>")]
@@ -1461,8 +1465,7 @@ async fn delete_cipher_selected_post(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    _delete_multiple_ciphers(data, headers, conn, CipherDeleteOptions::HardMulti, nt).await
-    // permanent delete
+    _delete_multiple_ciphers(data, headers, conn, false, nt).await // permanent delete
 }
 
 #[put("/ciphers/delete", data = "<data>")]
@@ -1472,8 +1475,7 @@ async fn delete_cipher_selected_put(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    _delete_multiple_ciphers(data, headers, conn, CipherDeleteOptions::SoftMulti, nt).await
-    // soft delete
+    _delete_multiple_ciphers(data, headers, conn, true, nt).await // soft delete
 }
 
 #[delete("/ciphers/admin", data = "<data>")]
@@ -1483,8 +1485,7 @@ async fn delete_cipher_selected_admin(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    _delete_multiple_ciphers(data, headers, conn, CipherDeleteOptions::HardMulti, nt).await
-    // permanent delete
+    _delete_multiple_ciphers(data, headers, conn, false, nt).await // permanent delete
 }
 
 #[post("/ciphers/delete-admin", data = "<data>")]
@@ -1494,8 +1495,7 @@ async fn delete_cipher_selected_post_admin(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    _delete_multiple_ciphers(data, headers, conn, CipherDeleteOptions::HardMulti, nt).await
-    // permanent delete
+    _delete_multiple_ciphers(data, headers, conn, false, nt).await // permanent delete
 }
 
 #[put("/ciphers/delete-admin", data = "<data>")]
@@ -1505,38 +1505,32 @@ async fn delete_cipher_selected_put_admin(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
-    _delete_multiple_ciphers(data, headers, conn, CipherDeleteOptions::SoftMulti, nt).await
-    // soft delete
+    _delete_multiple_ciphers(data, headers, conn, true, nt).await // soft delete
 }
 
 #[put("/ciphers/<cipher_id>/restore")]
-async fn restore_cipher_put(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
-    _restore_cipher_by_uuid(&cipher_id, &headers, false, &conn, &nt).await
+async fn restore_cipher_put(cipher_id: CipherId, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> JsonResult {
+    _restore_cipher_by_uuid(&cipher_id, &headers, &mut conn, &nt).await
 }
 
 #[put("/ciphers/<cipher_id>/restore-admin")]
-async fn restore_cipher_put_admin(cipher_id: CipherId, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
-    _restore_cipher_by_uuid(&cipher_id, &headers, false, &conn, &nt).await
-}
-
-#[put("/ciphers/restore-admin", data = "<data>")]
-async fn restore_cipher_selected_admin(
-    data: Json<CipherIdsData>,
+async fn restore_cipher_put_admin(
+    cipher_id: CipherId,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
-    _restore_multiple_ciphers(data, &headers, &conn, &nt).await
+    _restore_cipher_by_uuid(&cipher_id, &headers, &mut conn, &nt).await
 }
 
 #[put("/ciphers/restore", data = "<data>")]
 async fn restore_cipher_selected(
     data: Json<CipherIdsData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
-    _restore_multiple_ciphers(data, &headers, &conn, &nt).await
+    _restore_multiple_ciphers(data, &headers, &mut conn, &nt).await
 }
 
 #[derive(Deserialize)]
@@ -1550,51 +1544,39 @@ struct MoveCipherData {
 async fn move_cipher_selected(
     data: Json<MoveCipherData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
     let data = data.into_inner();
-    let user_id = &headers.user.uuid;
+    let user_id = headers.user.uuid;
 
     if let Some(ref folder_id) = data.folder_id {
-        if Folder::find_by_uuid_and_user(folder_id, user_id, &conn).await.is_none() {
+        if Folder::find_by_uuid_and_user(folder_id, &user_id, &mut conn).await.is_none() {
             err!("Invalid folder", "Folder does not exist or belongs to another user");
         }
     }
 
-    let cipher_count = data.ids.len();
-    let mut single_cipher: Option<Cipher> = None;
+    for cipher_id in data.ids {
+        let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &mut conn).await else {
+            err!("Cipher doesn't exist")
+        };
 
-    // TODO: Convert this to use a single query (or at least less) to update all items
-    // Find all ciphers a user has access to, all others will be ignored
-    let accessible_ciphers = Cipher::find_by_user_and_ciphers(user_id, &data.ids, &conn).await;
-    let accessible_ciphers_count = accessible_ciphers.len();
-    for cipher in accessible_ciphers {
-        cipher.move_to_folder(data.folder_id.clone(), user_id, &conn).await?;
-        if cipher_count == 1 {
-            single_cipher = Some(cipher);
+        if !cipher.is_accessible_to_user(&user_id, &mut conn).await {
+            err!("Cipher is not accessible by user")
         }
-    }
 
-    if let Some(cipher) = single_cipher {
+        // Move cipher
+        cipher.move_to_folder(data.folder_id.clone(), &user_id, &mut conn).await?;
+
         nt.send_cipher_update(
             UpdateType::SyncCipherUpdate,
             &cipher,
-            std::slice::from_ref(user_id),
+            std::slice::from_ref(&user_id),
             &headers.device,
             None,
-            &conn,
+            &mut conn,
         )
         .await;
-    } else {
-        // Multi move actions do not send out a push for each cipher, we need to send a general sync here
-        nt.send_user_update(UpdateType::SyncCiphers, &headers.user, &headers.device.push_uuid, &conn).await;
-    }
-
-    if cipher_count != accessible_ciphers_count {
-        err!(format!(
-            "Not all ciphers are moved! {accessible_ciphers_count} of the selected {cipher_count} were moved."
-        ))
     }
 
     Ok(())
@@ -1621,23 +1603,23 @@ async fn delete_all(
     organization: Option<OrganizationIdData>,
     data: Json<PasswordOrOtpData>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
     let data: PasswordOrOtpData = data.into_inner();
     let mut user = headers.user;
 
-    data.validate(&user, true, &conn).await?;
+    data.validate(&user, true, &mut conn).await?;
 
     match organization {
         Some(org_data) => {
             // Organization ID in query params, purging organization vault
-            match Membership::find_by_user_and_org(&user.uuid, &org_data.org_id, &conn).await {
+            match Membership::find_by_user_and_org(&user.uuid, &org_data.org_id, &mut conn).await {
                 None => err!("You don't have permission to purge the organization vault"),
                 Some(member) => {
                     if member.atype == MembershipType::Owner {
-                        Cipher::delete_all_by_organization(&org_data.org_id, &conn).await?;
-                        nt.send_user_update(UpdateType::SyncVault, &user, &headers.device.push_uuid, &conn).await;
+                        Cipher::delete_all_by_organization(&org_data.org_id, &mut conn).await?;
+                        nt.send_user_update(UpdateType::SyncVault, &user, &headers.device.push_uuid, &mut conn).await;
 
                         log_event(
                             EventType::OrganizationPurgedVault as i32,
@@ -1646,7 +1628,7 @@ async fn delete_all(
                             &user.uuid,
                             headers.device.atype,
                             &headers.ip.ip,
-                            &conn,
+                            &mut conn,
                         )
                         .await;
 
@@ -1660,36 +1642,28 @@ async fn delete_all(
         None => {
             // No organization ID in query params, purging user vault
             // Delete ciphers and their attachments
-            for cipher in Cipher::find_owned_by_user(&user.uuid, &conn).await {
-                cipher.delete(&conn).await?;
+            for cipher in Cipher::find_owned_by_user(&user.uuid, &mut conn).await {
+                cipher.delete(&mut conn).await?;
             }
 
             // Delete folders
-            for f in Folder::find_by_user(&user.uuid, &conn).await {
-                f.delete(&conn).await?;
+            for f in Folder::find_by_user(&user.uuid, &mut conn).await {
+                f.delete(&mut conn).await?;
             }
 
-            user.update_revision(&conn).await?;
-            nt.send_user_update(UpdateType::SyncVault, &user, &headers.device.push_uuid, &conn).await;
+            user.update_revision(&mut conn).await?;
+            nt.send_user_update(UpdateType::SyncVault, &user, &headers.device.push_uuid, &mut conn).await;
 
             Ok(())
         }
     }
 }
 
-#[derive(PartialEq)]
-pub enum CipherDeleteOptions {
-    SoftSingle,
-    SoftMulti,
-    HardSingle,
-    HardMulti,
-}
-
 async fn _delete_cipher_by_uuid(
     cipher_id: &CipherId,
     headers: &Headers,
-    conn: &DbConn,
-    delete_options: &CipherDeleteOptions,
+    conn: &mut DbConn,
+    soft_delete: bool,
     nt: &Notify<'_>,
 ) -> EmptyResult {
     let Some(mut cipher) = Cipher::find_by_uuid(cipher_id, conn).await else {
@@ -1700,42 +1674,35 @@ async fn _delete_cipher_by_uuid(
         err!("Cipher can't be deleted by user")
     }
 
-    if *delete_options == CipherDeleteOptions::SoftSingle || *delete_options == CipherDeleteOptions::SoftMulti {
+    if soft_delete {
         cipher.deleted_at = Some(Utc::now().naive_utc());
         cipher.save(conn).await?;
-        if *delete_options == CipherDeleteOptions::SoftSingle {
-            nt.send_cipher_update(
-                UpdateType::SyncCipherUpdate,
-                &cipher,
-                &cipher.update_users_revision(conn).await,
-                &headers.device,
-                None,
-                conn,
-            )
-            .await;
-        }
+        nt.send_cipher_update(
+            UpdateType::SyncCipherUpdate,
+            &cipher,
+            &cipher.update_users_revision(conn).await,
+            &headers.device,
+            None,
+            conn,
+        )
+        .await;
     } else {
         cipher.delete(conn).await?;
-        if *delete_options == CipherDeleteOptions::HardSingle {
-            nt.send_cipher_update(
-                UpdateType::SyncLoginDelete,
-                &cipher,
-                &cipher.update_users_revision(conn).await,
-                &headers.device,
-                None,
-                conn,
-            )
-            .await;
-        }
+        nt.send_cipher_update(
+            UpdateType::SyncCipherDelete,
+            &cipher,
+            &cipher.update_users_revision(conn).await,
+            &headers.device,
+            None,
+            conn,
+        )
+        .await;
     }
 
     if let Some(org_id) = cipher.organization_uuid {
-        let event_type = if *delete_options == CipherDeleteOptions::SoftSingle
-            || *delete_options == CipherDeleteOptions::SoftMulti
-        {
-            EventType::CipherSoftDeleted as i32
-        } else {
-            EventType::CipherDeleted as i32
+        let event_type = match soft_delete {
+            true => EventType::CipherSoftDeleted as i32,
+            false => EventType::CipherDeleted as i32,
         };
 
         log_event(event_type, &cipher.uuid, &org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
@@ -1754,20 +1721,17 @@ struct CipherIdsData {
 async fn _delete_multiple_ciphers(
     data: Json<CipherIdsData>,
     headers: Headers,
-    conn: DbConn,
-    delete_options: CipherDeleteOptions,
+    mut conn: DbConn,
+    soft_delete: bool,
     nt: Notify<'_>,
 ) -> EmptyResult {
     let data = data.into_inner();
 
     for cipher_id in data.ids {
-        if let error @ Err(_) = _delete_cipher_by_uuid(&cipher_id, &headers, &conn, &delete_options, &nt).await {
+        if let error @ Err(_) = _delete_cipher_by_uuid(&cipher_id, &headers, &mut conn, soft_delete, &nt).await {
             return error;
         };
     }
-
-    // Multi delete actions do not send out a push for each cipher, we need to send a general sync here
-    nt.send_user_update(UpdateType::SyncCiphers, &headers.user, &headers.device.push_uuid, &conn).await;
 
     Ok(())
 }
@@ -1775,8 +1739,7 @@ async fn _delete_multiple_ciphers(
 async fn _restore_cipher_by_uuid(
     cipher_id: &CipherId,
     headers: &Headers,
-    multi_restore: bool,
-    conn: &DbConn,
+    conn: &mut DbConn,
     nt: &Notify<'_>,
 ) -> JsonResult {
     let Some(mut cipher) = Cipher::find_by_uuid(cipher_id, conn).await else {
@@ -1790,17 +1753,15 @@ async fn _restore_cipher_by_uuid(
     cipher.deleted_at = None;
     cipher.save(conn).await?;
 
-    if !multi_restore {
-        nt.send_cipher_update(
-            UpdateType::SyncCipherUpdate,
-            &cipher,
-            &cipher.update_users_revision(conn).await,
-            &headers.device,
-            None,
-            conn,
-        )
-        .await;
-    }
+    nt.send_cipher_update(
+        UpdateType::SyncCipherUpdate,
+        &cipher,
+        &cipher.update_users_revision(conn).await,
+        &headers.device,
+        None,
+        conn,
+    )
+    .await;
 
     if let Some(org_id) = &cipher.organization_uuid {
         log_event(
@@ -1821,21 +1782,18 @@ async fn _restore_cipher_by_uuid(
 async fn _restore_multiple_ciphers(
     data: Json<CipherIdsData>,
     headers: &Headers,
-    conn: &DbConn,
+    conn: &mut DbConn,
     nt: &Notify<'_>,
 ) -> JsonResult {
     let data = data.into_inner();
 
     let mut ciphers: Vec<Value> = Vec::new();
     for cipher_id in data.ids {
-        match _restore_cipher_by_uuid(&cipher_id, headers, true, conn, nt).await {
+        match _restore_cipher_by_uuid(&cipher_id, headers, conn, nt).await {
             Ok(json) => ciphers.push(json.into_inner()),
             err => return err,
         }
     }
-
-    // Multi move actions do not send out a push for each cipher, we need to send a general sync here
-    nt.send_user_update(UpdateType::SyncCiphers, &headers.user, &headers.device.push_uuid, conn).await;
 
     Ok(Json(json!({
       "data": ciphers,
@@ -1848,7 +1806,7 @@ async fn _delete_cipher_attachment_by_id(
     cipher_id: &CipherId,
     attachment_id: &AttachmentId,
     headers: &Headers,
-    conn: &DbConn,
+    conn: &mut DbConn,
     nt: &Notify<'_>,
 ) -> JsonResult {
     let Some(attachment) = Attachment::find_by_id(attachment_id, conn).await else {
@@ -1917,7 +1875,7 @@ pub enum CipherSyncType {
 }
 
 impl CipherSyncData {
-    pub async fn new(user_id: &UserId, sync_type: CipherSyncType, conn: &DbConn) -> Self {
+    pub async fn new(user_id: &UserId, sync_type: CipherSyncType, conn: &mut DbConn) -> Self {
         let cipher_folders: HashMap<CipherId, FolderId>;
         let cipher_favorites: HashSet<CipherId>;
         match sync_type {

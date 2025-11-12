@@ -1,4 +1,4 @@
-use chrono::{naive::serde::ts_seconds, NaiveDateTime, TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rocket::{serde::json::Json, Route};
 
 use crate::{
@@ -23,17 +23,16 @@ pub struct ProtectedActionData {
     /// Token issued to validate the protected action
     pub token: String,
     /// UNIX timestamp of token issue.
-    #[serde(with = "ts_seconds")]
-    pub token_sent: NaiveDateTime,
+    pub token_sent: i64,
     // The total amount of attempts
-    pub attempts: u64,
+    pub attempts: u8,
 }
 
 impl ProtectedActionData {
     pub fn new(token: String) -> Self {
         Self {
             token,
-            token_sent: Utc::now().naive_utc(),
+            token_sent: Utc::now().timestamp(),
             attempts: 0,
         }
     }
@@ -51,16 +50,12 @@ impl ProtectedActionData {
     }
 
     pub fn add_attempt(&mut self) {
-        self.attempts = self.attempts.saturating_add(1);
-    }
-
-    pub fn time_since_sent(&self) -> TimeDelta {
-        Utc::now().naive_utc() - self.token_sent
+        self.attempts += 1;
     }
 }
 
 #[post("/accounts/request-otp")]
-async fn request_otp(headers: Headers, conn: DbConn) -> EmptyResult {
+async fn request_otp(headers: Headers, mut conn: DbConn) -> EmptyResult {
     if !CONFIG.mail_enabled() {
         err!("Email is disabled for this server. Either enable email or login using your master password instead of login via device.");
     }
@@ -68,16 +63,10 @@ async fn request_otp(headers: Headers, conn: DbConn) -> EmptyResult {
     let user = headers.user;
 
     // Only one Protected Action per user is allowed to take place, delete the previous one
-    if let Some(pa) = TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::ProtectedActions as i32, &conn).await
+    if let Some(pa) =
+        TwoFactor::find_by_user_and_type(&user.uuid, TwoFactorType::ProtectedActions as i32, &mut conn).await
     {
-        let pa_data = ProtectedActionData::from_json(&pa.data)?;
-        let elapsed = pa_data.time_since_sent().num_seconds();
-        let delay = 30;
-        if elapsed < delay {
-            err!(format!("Please wait {} seconds before requesting another code.", (delay - elapsed)));
-        }
-
-        pa.delete(&conn).await?;
+        pa.delete(&mut conn).await?;
     }
 
     let generated_token = crypto::generate_email_token(CONFIG.email_token_size());
@@ -85,7 +74,7 @@ async fn request_otp(headers: Headers, conn: DbConn) -> EmptyResult {
 
     // Uses EmailVerificationChallenge as type to show that it's not verified yet.
     let twofactor = TwoFactor::new(user.uuid, TwoFactorType::ProtectedActions, pa_data.to_json());
-    twofactor.save(&conn).await?;
+    twofactor.save(&mut conn).await?;
 
     mail::send_protected_action_token(&user.email, &pa_data.token).await?;
 
@@ -100,7 +89,7 @@ struct ProtectedActionVerify {
 }
 
 #[post("/accounts/verify-otp", data = "<data>")]
-async fn verify_otp(data: Json<ProtectedActionVerify>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn verify_otp(data: Json<ProtectedActionVerify>, headers: Headers, mut conn: DbConn) -> EmptyResult {
     if !CONFIG.mail_enabled() {
         err!("Email is disabled for this server. Either enable email or login using your master password instead of login via device.");
     }
@@ -110,31 +99,33 @@ async fn verify_otp(data: Json<ProtectedActionVerify>, headers: Headers, conn: D
 
     // Delete the token after one validation attempt
     // This endpoint only gets called for the vault export, and doesn't need a second attempt
-    validate_protected_action_otp(&data.otp, &user.uuid, true, &conn).await
+    validate_protected_action_otp(&data.otp, &user.uuid, true, &mut conn).await
 }
 
 pub async fn validate_protected_action_otp(
     otp: &str,
     user_id: &UserId,
     delete_if_valid: bool,
-    conn: &DbConn,
+    conn: &mut DbConn,
 ) -> EmptyResult {
-    let mut pa = TwoFactor::find_by_user_and_type(user_id, TwoFactorType::ProtectedActions as i32, conn)
+    let pa = TwoFactor::find_by_user_and_type(user_id, TwoFactorType::ProtectedActions as i32, conn)
         .await
         .map_res("Protected action token not found, try sending the code again or restart the process")?;
     let mut pa_data = ProtectedActionData::from_json(&pa.data)?;
-    pa_data.add_attempt();
-    pa.data = pa_data.to_json();
 
-    // Fail after x attempts if the token has been used too many times.
-    // Don't delete it, as we use it to keep track of attempts.
-    if pa_data.attempts >= CONFIG.email_attempts_limit() {
+    pa_data.add_attempt();
+    // Delete the token after x attempts if it has been used too many times
+    // We use the 6, which should be more then enough for invalid attempts and multiple valid checks
+    if pa_data.attempts > 6 {
+        pa.delete(conn).await?;
         err!("Token has expired")
     }
 
     // Check if the token has expired (Using the email 2fa expiration time)
+    let date =
+        DateTime::from_timestamp(pa_data.token_sent, 0).expect("Protected Action token timestamp invalid.").naive_utc();
     let max_time = CONFIG.email_expiration_time() as i64;
-    if pa_data.time_since_sent().num_seconds() > max_time {
+    if date + TimeDelta::try_seconds(max_time).unwrap() < Utc::now().naive_utc() {
         pa.delete(conn).await?;
         err!("Token has expired")
     }

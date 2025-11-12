@@ -50,15 +50,11 @@ pub fn events_routes() -> Vec<Route> {
 use rocket::{serde::json::Json, serde::json::Value, Catcher, Route};
 
 use crate::{
-    api::{EmptyResult, JsonResult, Notify, UpdateType},
+    api::{JsonResult, Notify, UpdateType},
     auth::Headers,
-    db::{
-        models::{Membership, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyErr, Organization, User},
-        DbConn,
-    },
+    db::DbConn,
     error::Error,
     http_client::make_http_request,
-    mail,
     util::parse_experimental_client_feature_flags,
 };
 
@@ -109,7 +105,12 @@ struct EquivDomainData {
 }
 
 #[post("/settings/domains", data = "<data>")]
-async fn post_eq_domains(data: Json<EquivDomainData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
+async fn post_eq_domains(
+    data: Json<EquivDomainData>,
+    headers: Headers,
+    mut conn: DbConn,
+    nt: Notify<'_>,
+) -> JsonResult {
     let data: EquivDomainData = data.into_inner();
 
     let excluded_globals = data.excluded_global_equivalent_domains.unwrap_or_default();
@@ -121,9 +122,9 @@ async fn post_eq_domains(data: Json<EquivDomainData>, headers: Headers, conn: Db
     user.excluded_globals = to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_string());
     user.equivalent_domains = to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_string());
 
-    user.save(&conn).await?;
+    user.save(&mut conn).await?;
 
-    nt.send_user_update(UpdateType::SyncSettings, &user, &headers.device.push_uuid, &conn).await;
+    nt.send_user_update(UpdateType::SyncSettings, &user, &headers.device.push_uuid, &mut conn).await;
 
     Ok(Json(json!({})))
 }
@@ -257,50 +258,4 @@ fn api_not_found() -> Json<Value> {
             "description": "The requested resource could not be found."
         }
     }))
-}
-
-async fn accept_org_invite(
-    user: &User,
-    mut member: Membership,
-    reset_password_key: Option<String>,
-    conn: &DbConn,
-) -> EmptyResult {
-    if member.status != MembershipStatus::Invited as i32 {
-        err!("User already accepted the invitation");
-    }
-
-    // This check is also done at accept_invite, _confirm_invite, _activate_member, edit_member, admin::update_membership_type
-    // It returns different error messages per function.
-    if member.atype < MembershipType::Admin {
-        match OrgPolicy::is_user_allowed(&member.user_uuid, &member.org_uuid, false, conn).await {
-            Ok(_) => {}
-            Err(OrgPolicyErr::TwoFactorMissing) => {
-                if crate::CONFIG.email_2fa_auto_fallback() {
-                    two_factor::email::activate_email_2fa(user, conn).await?;
-                } else {
-                    err!("You cannot join this organization until you enable two-step login on your user account");
-                }
-            }
-            Err(OrgPolicyErr::SingleOrgEnforced) => {
-                err!("You cannot join this organization because you are a member of an organization which forbids it");
-            }
-        }
-    }
-
-    member.status = MembershipStatus::Accepted as i32;
-    member.reset_password_key = reset_password_key;
-
-    member.save(conn).await?;
-
-    if crate::CONFIG.mail_enabled() {
-        let org = match Organization::find_by_uuid(&member.org_uuid, conn).await {
-            Some(org) => org,
-            None => err!("Organization not found."),
-        };
-        // User was invited to an organization, so they must be confirmed manually after acceptance
-        mail::send_invite_accepted(&user.email, &member.invited_by_email.unwrap_or(org.billing_email), &org.name)
-            .await?;
-    }
-
-    Ok(())
 }

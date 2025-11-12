@@ -24,28 +24,6 @@ function deleteUser(event) {
     }
 }
 
-function deleteSSOUser(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    const id = event.target.parentNode.dataset.vwUserUuid;
-    const email = event.target.parentNode.dataset.vwUserEmail;
-    if (!id || !email) {
-        alert("Required parameters not found!");
-        return false;
-    }
-    const input_email = prompt(`To delete user "${email}" SSO association, please type the email below`);
-    if (input_email != null) {
-        if (input_email == email) {
-            _delete(`${BASE_URL}/admin/users/${id}/sso`,
-                "User SSO association deleted correctly",
-                "Error deleting user SSO association"
-            );
-        } else {
-            alert("Wrong email, please try again");
-        }
-    }
-}
-
 function remove2fa(event) {
     event.preventDefault();
     event.stopPropagation();
@@ -268,9 +246,6 @@ function initUserTable() {
     document.querySelectorAll("button[vw-delete-user]").forEach(btn => {
         btn.addEventListener("click", deleteUser);
     });
-    document.querySelectorAll("button[vw-delete-sso-user]").forEach(btn => {
-        btn.addEventListener("click", deleteSSOUser);
-    });
     document.querySelectorAll("button[vw-disable-user]").forEach(btn => {
         btn.addEventListener("click", disableUser);
     });
@@ -288,8 +263,6 @@ function initUserTable() {
 
 // onLoad events
 document.addEventListener("DOMContentLoaded", (/*event*/) => {
-    const size = jQuery("#users-table > thead th").length;
-    const ssoOffset = size-7;
     jQuery("#users-table").DataTable({
         "drawCallback": function() {
             initUserTable();
@@ -302,10 +275,10 @@ document.addEventListener("DOMContentLoaded", (/*event*/) => {
         ],
         "pageLength": -1, // Default show all
         "columnDefs": [{
-            "targets": [1 + ssoOffset, 2 + ssoOffset],
+            "targets": [1, 2],
             "type": "date-iso"
         }, {
-            "targets": size-1,
+            "targets": 6,
             "searchable": false,
             "orderable": false
         }]

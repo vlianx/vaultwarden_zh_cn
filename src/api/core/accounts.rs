@@ -7,20 +7,13 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        core::{accept_org_invite, log_user_event, two_factor::email},
-        master_password_policy, register_push_device, unregister_push_device, AnonymousNotify, ApiResult, EmptyResult,
-        JsonResult, Notify, PasswordOrOtpData, UpdateType,
+        core::{log_user_event, two_factor::email},
+        master_password_policy, register_push_device, unregister_push_device, AnonymousNotify, EmptyResult, JsonResult,
+        Notify, PasswordOrOtpData, UpdateType,
     },
     auth::{decode_delete, decode_invite, decode_verify_email, ClientHeaders, Headers},
     crypto,
-    db::{
-        models::{
-            AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, EmergencyAccess,
-            EmergencyAccessId, EventType, Folder, FolderId, Invitation, Membership, MembershipId, OrgPolicy,
-            OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId, UserKdfType,
-        },
-        DbConn,
-    },
+    db::{models::*, DbConn},
     mail,
     util::{format_date, NumberOrString},
     CONFIG,
@@ -41,7 +34,6 @@ pub fn routes() -> Vec<rocket::Route> {
         get_public_keys,
         post_keys,
         post_password,
-        post_set_password,
         post_kdf,
         post_rotatekey,
         post_sstamp,
@@ -71,17 +63,7 @@ pub fn routes() -> Vec<rocket::Route> {
         put_auth_request,
         get_auth_request_response,
         get_auth_requests,
-        get_auth_requests_pending,
     ]
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KDFData {
-    kdf: i32,
-    kdf_iterations: i32,
-    kdf_memory: Option<i32>,
-    kdf_parallelism: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,8 +71,10 @@ pub struct KDFData {
 pub struct RegisterData {
     email: String,
 
-    #[serde(flatten)]
-    kdf: KDFData,
+    kdf: Option<i32>,
+    kdf_iterations: Option<i32>,
+    kdf_memory: Option<i32>,
+    kdf_parallelism: Option<i32>,
 
     #[serde(alias = "userSymmetricKey")]
     key: String,
@@ -111,19 +95,6 @@ pub struct RegisterData {
     accept_emergency_access_invite_token: Option<String>,
     #[serde(alias = "token")]
     org_invite_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetPasswordData {
-    #[serde(flatten)]
-    kdf: KDFData,
-
-    key: String,
-    keys: Option<KeysData>,
-    master_password_hash: String,
-    master_password_hint: Option<String>,
-    org_identifier: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,7 +121,7 @@ fn enforce_password_hint_setting(password_hint: &Option<String>) -> EmptyResult 
     }
     Ok(())
 }
-async fn is_email_2fa_required(member_id: Option<MembershipId>, conn: &DbConn) -> bool {
+async fn is_email_2fa_required(member_id: Option<MembershipId>, conn: &mut DbConn) -> bool {
     if !CONFIG._enable_email_2fa() {
         return false;
     }
@@ -168,7 +139,7 @@ async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     _register(data, false, conn).await
 }
 
-pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn: DbConn) -> JsonResult {
+pub async fn _register(data: Json<RegisterData>, email_verification: bool, mut conn: DbConn) -> JsonResult {
     let mut data: RegisterData = data.into_inner();
     let email = data.email.to_lowercase();
 
@@ -250,7 +221,7 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
     let password_hint = clean_password_hint(&data.master_password_hint);
     enforce_password_hint_setting(&password_hint)?;
 
-    let mut user = match User::find_by_mail(&email, &conn).await {
+    let mut user = match User::find_by_mail(&email, &mut conn).await {
         Some(user) => {
             if !user.password_hash.is_empty() {
                 err!("Registration not allowed or user already exists")
@@ -265,12 +236,15 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
                 } else {
                     err!("Registration email does not match invite email")
                 }
-            } else if Invitation::take(&email, &conn).await {
-                Membership::accept_user_invitations(&user.uuid, &conn).await?;
+            } else if Invitation::take(&email, &mut conn).await {
+                for membership in Membership::find_invited_by_user(&user.uuid, &mut conn).await.iter_mut() {
+                    membership.status = MembershipStatus::Accepted as i32;
+                    membership.save(&mut conn).await?;
+                }
                 user
             } else if CONFIG.is_signup_allowed(&email)
                 || (CONFIG.emergency_access_allowed()
-                    && EmergencyAccess::find_invited_by_grantee_email(&email, &conn).await.is_some())
+                    && EmergencyAccess::find_invited_by_grantee_email(&email, &mut conn).await.is_some())
             {
                 user
             } else {
@@ -281,11 +255,11 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
             // Order is important here; the invitation check must come first
             // because the vaultwarden admin can invite anyone, regardless
             // of other signup restrictions.
-            if Invitation::take(&email, &conn).await
+            if Invitation::take(&email, &mut conn).await
                 || CONFIG.is_signup_allowed(&email)
                 || pending_emergency_access.is_some()
             {
-                User::new(&email, None)
+                User::new(email.clone())
             } else {
                 err!("Registration not allowed or user already exists")
             }
@@ -293,9 +267,18 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
     };
 
     // Make sure we don't leave a lingering invitation.
-    Invitation::take(&email, &conn).await;
+    Invitation::take(&email, &mut conn).await;
 
-    set_kdf_data(&mut user, &data.kdf)?;
+    if let Some(client_kdf_type) = data.kdf {
+        user.client_kdf_type = client_kdf_type;
+    }
+
+    if let Some(client_kdf_iter) = data.kdf_iterations {
+        user.client_kdf_iter = client_kdf_iter;
+    }
+
+    user.client_kdf_memory = data.kdf_memory;
+    user.client_kdf_parallelism = data.kdf_parallelism;
 
     user.set_password(&data.master_password_hash, Some(data.key), true, None);
     user.password_hint = password_hint;
@@ -324,17 +307,17 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
             error!("Error sending welcome email: {e:#?}");
         }
 
-        if email_verified && is_email_2fa_required(data.organization_user_id, &conn).await {
-            email::activate_email_2fa(&user, &conn).await.ok();
+        if email_verified && is_email_2fa_required(data.organization_user_id, &mut conn).await {
+            email::activate_email_2fa(&user, &mut conn).await.ok();
         }
     }
 
-    user.save(&conn).await?;
+    user.save(&mut conn).await?;
 
     // accept any open emergency access invitations
     if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {
-        for mut emergency_invite in EmergencyAccess::find_all_invited_by_grantee_email(&user.email, &conn).await {
-            emergency_invite.accept_invite(&user.uuid, &user.email, &conn).await.ok();
+        for mut emergency_invite in EmergencyAccess::find_all_invited_by_grantee_email(&user.email, &mut conn).await {
+            emergency_invite.accept_invite(&user.uuid, &user.email, &mut conn).await.ok();
         }
     }
 
@@ -344,71 +327,9 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
     })))
 }
 
-#[post("/accounts/set-password", data = "<data>")]
-async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: DbConn) -> JsonResult {
-    let data: SetPasswordData = data.into_inner();
-    let mut user = headers.user;
-
-    if user.private_key.is_some() {
-        err!("Account already initialized, cannot set password")
-    }
-
-    // Check against the password hint setting here so if it fails,
-    // the user can retry without losing their invitation below.
-    let password_hint = clean_password_hint(&data.master_password_hint);
-    enforce_password_hint_setting(&password_hint)?;
-
-    set_kdf_data(&mut user, &data.kdf)?;
-
-    user.set_password(
-        &data.master_password_hash,
-        Some(data.key),
-        false,
-        Some(vec![String::from("revision_date")]), // We need to allow revision-date to use the old security_timestamp
-    );
-    user.password_hint = password_hint;
-
-    if let Some(keys) = data.keys {
-        user.private_key = Some(keys.encrypted_private_key);
-        user.public_key = Some(keys.public_key);
-    }
-
-    if let Some(identifier) = data.org_identifier {
-        if identifier != crate::sso::FAKE_IDENTIFIER {
-            let org = match Organization::find_by_uuid(&identifier.into(), &conn).await {
-                None => err!("Failed to retrieve the associated organization"),
-                Some(org) => org,
-            };
-
-            let membership = match Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await {
-                None => err!("Failed to retrieve the invitation"),
-                Some(org) => org,
-            };
-
-            accept_org_invite(&user, membership, None, &conn).await?;
-        }
-    }
-
-    if CONFIG.mail_enabled() {
-        mail::send_welcome(&user.email.to_lowercase()).await?;
-    } else {
-        Membership::accept_user_invitations(&user.uuid, &conn).await?;
-    }
-
-    log_user_event(EventType::UserChangedPassword as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn)
-        .await;
-
-    user.save(&conn).await?;
-
-    Ok(Json(json!({
-      "Object": "set-password",
-      "CaptchaBypassToken": "",
-    })))
-}
-
 #[get("/accounts/profile")]
-async fn profile(headers: Headers, conn: DbConn) -> Json<Value> {
-    Json(headers.user.to_json(&conn).await)
+async fn profile(headers: Headers, mut conn: DbConn) -> Json<Value> {
+    Json(headers.user.to_json(&mut conn).await)
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,7 +345,7 @@ async fn put_profile(data: Json<ProfileData>, headers: Headers, conn: DbConn) ->
 }
 
 #[post("/accounts/profile", data = "<data>")]
-async fn post_profile(data: Json<ProfileData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn post_profile(data: Json<ProfileData>, headers: Headers, mut conn: DbConn) -> JsonResult {
     let data: ProfileData = data.into_inner();
 
     // Check if the length of the username exceeds 50 characters (Same is Upstream Bitwarden)
@@ -436,8 +357,8 @@ async fn post_profile(data: Json<ProfileData>, headers: Headers, conn: DbConn) -
     let mut user = headers.user;
     user.name = data.name;
 
-    user.save(&conn).await?;
-    Ok(Json(user.to_json(&conn).await))
+    user.save(&mut conn).await?;
+    Ok(Json(user.to_json(&mut conn).await))
 }
 
 #[derive(Deserialize)]
@@ -447,7 +368,7 @@ struct AvatarData {
 }
 
 #[put("/accounts/avatar", data = "<data>")]
-async fn put_avatar(data: Json<AvatarData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn put_avatar(data: Json<AvatarData>, headers: Headers, mut conn: DbConn) -> JsonResult {
     let data: AvatarData = data.into_inner();
 
     // It looks like it only supports the 6 hex color format.
@@ -462,13 +383,13 @@ async fn put_avatar(data: Json<AvatarData>, headers: Headers, conn: DbConn) -> J
     let mut user = headers.user;
     user.avatar_color = data.avatar_color;
 
-    user.save(&conn).await?;
-    Ok(Json(user.to_json(&conn).await))
+    user.save(&mut conn).await?;
+    Ok(Json(user.to_json(&mut conn).await))
 }
 
 #[get("/users/<user_id>/public-key")]
-async fn get_public_keys(user_id: UserId, _headers: Headers, conn: DbConn) -> JsonResult {
-    let user = match User::find_by_uuid(&user_id, &conn).await {
+async fn get_public_keys(user_id: UserId, _headers: Headers, mut conn: DbConn) -> JsonResult {
+    let user = match User::find_by_uuid(&user_id, &mut conn).await {
         Some(user) if user.public_key.is_some() => user,
         Some(_) => err_code!("User has no public_key", Status::NotFound.code),
         None => err_code!("User doesn't exist", Status::NotFound.code),
@@ -482,7 +403,7 @@ async fn get_public_keys(user_id: UserId, _headers: Headers, conn: DbConn) -> Js
 }
 
 #[post("/accounts/keys", data = "<data>")]
-async fn post_keys(data: Json<KeysData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn post_keys(data: Json<KeysData>, headers: Headers, mut conn: DbConn) -> JsonResult {
     let data: KeysData = data.into_inner();
 
     let mut user = headers.user;
@@ -490,7 +411,7 @@ async fn post_keys(data: Json<KeysData>, headers: Headers, conn: DbConn) -> Json
     user.private_key = Some(data.encrypted_private_key);
     user.public_key = Some(data.public_key);
 
-    user.save(&conn).await?;
+    user.save(&mut conn).await?;
 
     Ok(Json(json!({
         "privateKey": user.private_key,
@@ -509,7 +430,7 @@ struct ChangePassData {
 }
 
 #[post("/accounts/password", data = "<data>")]
-async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+async fn post_password(data: Json<ChangePassData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let data: ChangePassData = data.into_inner();
     let mut user = headers.user;
 
@@ -520,7 +441,7 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
     user.password_hint = clean_password_hint(&data.master_password_hint);
     enforce_password_hint_setting(&user.password_hint)?;
 
-    log_user_event(EventType::UserChangedPassword as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &conn)
+    log_user_event(EventType::UserChangedPassword as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &mut conn)
         .await;
 
     user.set_password(
@@ -535,12 +456,12 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
         ]),
     );
 
-    let save_result = user.save(&conn).await;
+    let save_result = user.save(&mut conn).await;
 
     // Prevent logging out the client where the user requested this endpoint from.
     // If you do logout the user it will causes issues at the client side.
     // Adding the device uuid will prevent this.
-    nt.send_logout(&user, Some(headers.device.uuid.clone()), &conn).await;
+    nt.send_logout(&user, Some(headers.device.uuid.clone()), &mut conn).await;
 
     save_result
 }
@@ -548,15 +469,25 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChangeKdfData {
-    #[serde(flatten)]
-    kdf: KDFData,
+    kdf: i32,
+    kdf_iterations: i32,
+    kdf_memory: Option<i32>,
+    kdf_parallelism: Option<i32>,
 
     master_password_hash: String,
     new_master_password_hash: String,
     key: String,
 }
 
-fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
+#[post("/accounts/kdf", data = "<data>")]
+async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+    let data: ChangeKdfData = data.into_inner();
+    let mut user = headers.user;
+
+    if !user.check_valid_password(&data.master_password_hash) {
+        err!("Invalid password")
+    }
+
     if data.kdf == UserKdfType::Pbkdf2 as i32 && data.kdf_iterations < 100_000 {
         err!("PBKDF2 KDF iterations must be at least 100000.")
     }
@@ -587,25 +518,10 @@ fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
     }
     user.client_kdf_iter = data.kdf_iterations;
     user.client_kdf_type = data.kdf;
-
-    Ok(())
-}
-
-#[post("/accounts/kdf", data = "<data>")]
-async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
-    let data: ChangeKdfData = data.into_inner();
-    let mut user = headers.user;
-
-    if !user.check_valid_password(&data.master_password_hash) {
-        err!("Invalid password")
-    }
-
-    set_kdf_data(&mut user, &data.kdf)?;
-
     user.set_password(&data.new_master_password_hash, Some(data.key), true, None);
-    let save_result = user.save(&conn).await;
+    let save_result = user.save(&mut conn).await;
 
-    nt.send_logout(&user, Some(headers.device.uuid.clone()), &conn).await;
+    nt.send_logout(&user, Some(headers.device.uuid.clone()), &mut conn).await;
 
     save_result
 }
@@ -760,7 +676,7 @@ fn validate_keydata(
 }
 
 #[post("/accounts/key-management/rotate-user-account-keys", data = "<data>")]
-async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+async fn post_rotatekey(data: Json<KeyData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     // TODO: See if we can wrap everything within a SQL Transaction. If something fails it should revert everything.
     let data: KeyData = data.into_inner();
 
@@ -778,13 +694,13 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
 
     // TODO: Ideally we'd do everything after this point in a single transaction.
 
-    let mut existing_ciphers = Cipher::find_owned_by_user(user_id, &conn).await;
-    let mut existing_folders = Folder::find_by_user(user_id, &conn).await;
-    let mut existing_emergency_access = EmergencyAccess::find_all_confirmed_by_grantor_uuid(user_id, &conn).await;
-    let mut existing_memberships = Membership::find_by_user(user_id, &conn).await;
+    let mut existing_ciphers = Cipher::find_owned_by_user(user_id, &mut conn).await;
+    let mut existing_folders = Folder::find_by_user(user_id, &mut conn).await;
+    let mut existing_emergency_access = EmergencyAccess::find_all_by_grantor_uuid(user_id, &mut conn).await;
+    let mut existing_memberships = Membership::find_by_user(user_id, &mut conn).await;
     // We only rotate the reset password key if it is set.
     existing_memberships.retain(|m| m.reset_password_key.is_some());
-    let mut existing_sends = Send::find_by_user(user_id, &conn).await;
+    let mut existing_sends = Send::find_by_user(user_id, &mut conn).await;
 
     validate_keydata(
         &data,
@@ -806,7 +722,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
             };
 
             saved_folder.name = folder_data.name;
-            saved_folder.save(&conn).await?
+            saved_folder.save(&mut conn).await?
         }
     }
 
@@ -819,7 +735,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
         };
 
         saved_emergency_access.key_encrypted = Some(emergency_access_data.key_encrypted);
-        saved_emergency_access.save(&conn).await?
+        saved_emergency_access.save(&mut conn).await?
     }
 
     // Update reset password data
@@ -831,7 +747,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
         };
 
         membership.reset_password_key = Some(reset_password_data.reset_password_key);
-        membership.save(&conn).await?
+        membership.save(&mut conn).await?
     }
 
     // Update send data
@@ -840,7 +756,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
             err!("Send doesn't exist")
         };
 
-        update_send_from_data(send, send_data, &headers, &conn, &nt, UpdateType::None).await?;
+        update_send_from_data(send, send_data, &headers, &mut conn, &nt, UpdateType::None).await?;
     }
 
     // Update cipher data
@@ -856,7 +772,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
             // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
             // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
             // We force the users to logout after the user has been saved to try and prevent these issues.
-            update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?
+            update_cipher_from_data(saved_cipher, cipher_data, &headers, None, &mut conn, &nt, UpdateType::None).await?
         }
     }
 
@@ -871,28 +787,28 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
         None,
     );
 
-    let save_result = user.save(&conn).await;
+    let save_result = user.save(&mut conn).await;
 
     // Prevent logging out the client where the user requested this endpoint from.
     // If you do logout the user it will causes issues at the client side.
     // Adding the device uuid will prevent this.
-    nt.send_logout(&user, Some(headers.device.uuid.clone()), &conn).await;
+    nt.send_logout(&user, Some(headers.device.uuid.clone()), &mut conn).await;
 
     save_result
 }
 
 #[post("/accounts/security-stamp", data = "<data>")]
-async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let data: PasswordOrOtpData = data.into_inner();
     let mut user = headers.user;
 
-    data.validate(&user, true, &conn).await?;
+    data.validate(&user, true, &mut conn).await?;
 
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    Device::delete_all_by_user(&user.uuid, &mut conn).await?;
     user.reset_security_stamp();
-    let save_result = user.save(&conn).await;
+    let save_result = user.save(&mut conn).await;
 
-    nt.send_logout(&user, None, &conn).await;
+    nt.send_logout(&user, None, &mut conn).await;
 
     save_result
 }
@@ -905,7 +821,7 @@ struct EmailTokenData {
 }
 
 #[post("/accounts/email-token", data = "<data>")]
-async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, mut conn: DbConn) -> EmptyResult {
     if !CONFIG.email_change_allowed() {
         err!("Email change is not allowed.");
     }
@@ -917,20 +833,10 @@ async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, conn: Db
         err!("Invalid password")
     }
 
-    if let Some(existing_user) = User::find_by_mail(&data.new_email, &conn).await {
+    if User::find_by_mail(&data.new_email, &mut conn).await.is_some() {
         if CONFIG.mail_enabled() {
-            // check if existing_user has already registered
-            if existing_user.password_hash.is_empty() {
-                // inform an invited user about how to delete their temporary account if the
-                // request was done intentionally and they want to update their mail address
-                if let Err(e) = mail::send_change_email_invited(&data.new_email, &user.email).await {
-                    error!("Error sending change-email-invited email: {e:#?}");
-                }
-            } else {
-                // inform existing user about the failed attempt to change their mail address
-                if let Err(e) = mail::send_change_email_existing(&data.new_email, &user.email).await {
-                    error!("Error sending change-email-existing email: {e:#?}");
-                }
+            if let Err(e) = mail::send_change_email_existing(&data.new_email, &user.email).await {
+                error!("Error sending change-email-existing email: {e:#?}");
             }
         }
         err!("Email already in use");
@@ -952,7 +858,7 @@ async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, conn: Db
 
     user.email_new = Some(data.new_email);
     user.email_new_token = Some(token);
-    user.save(&conn).await
+    user.save(&mut conn).await
 }
 
 #[derive(Deserialize)]
@@ -967,7 +873,7 @@ struct ChangeEmailData {
 }
 
 #[post("/accounts/email", data = "<data>")]
-async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
+async fn post_email(data: Json<ChangeEmailData>, headers: Headers, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     if !CONFIG.email_change_allowed() {
         err!("Email change is not allowed.");
     }
@@ -979,7 +885,7 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
         err!("Invalid password")
     }
 
-    if User::find_by_mail(&data.new_email, &conn).await.is_some() {
+    if User::find_by_mail(&data.new_email, &mut conn).await.is_some() {
         err!("Email already in use");
     }
 
@@ -1013,9 +919,9 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
 
     user.set_password(&data.new_master_password_hash, Some(data.key), true, None);
 
-    let save_result = user.save(&conn).await;
+    let save_result = user.save(&mut conn).await;
 
-    nt.send_logout(&user, None, &conn).await;
+    nt.send_logout(&user, None, &mut conn).await;
 
     save_result
 }
@@ -1043,10 +949,10 @@ struct VerifyEmailTokenData {
 }
 
 #[post("/accounts/verify-email-token", data = "<data>")]
-async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn) -> EmptyResult {
+async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, mut conn: DbConn) -> EmptyResult {
     let data: VerifyEmailTokenData = data.into_inner();
 
-    let Some(mut user) = User::find_by_uuid(&data.user_id, &conn).await else {
+    let Some(mut user) = User::find_by_uuid(&data.user_id, &mut conn).await else {
         err!("User doesn't exist")
     };
 
@@ -1059,7 +965,7 @@ async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn)
     user.verified_at = Some(Utc::now().naive_utc());
     user.last_verifying_at = None;
     user.login_verify_count = 0;
-    if let Err(e) = user.save(&conn).await {
+    if let Err(e) = user.save(&mut conn).await {
         error!("Error saving email verification: {e:#?}");
     }
 
@@ -1073,11 +979,11 @@ struct DeleteRecoverData {
 }
 
 #[post("/accounts/delete-recover", data = "<data>")]
-async fn post_delete_recover(data: Json<DeleteRecoverData>, conn: DbConn) -> EmptyResult {
+async fn post_delete_recover(data: Json<DeleteRecoverData>, mut conn: DbConn) -> EmptyResult {
     let data: DeleteRecoverData = data.into_inner();
 
     if CONFIG.mail_enabled() {
-        if let Some(user) = User::find_by_mail(&data.email, &conn).await {
+        if let Some(user) = User::find_by_mail(&data.email, &mut conn).await {
             if let Err(e) = mail::send_delete_account(&user.email, &user.uuid).await {
                 error!("Error sending delete account email: {e:#?}");
             }
@@ -1100,21 +1006,21 @@ struct DeleteRecoverTokenData {
 }
 
 #[post("/accounts/delete-recover-token", data = "<data>")]
-async fn post_delete_recover_token(data: Json<DeleteRecoverTokenData>, conn: DbConn) -> EmptyResult {
+async fn post_delete_recover_token(data: Json<DeleteRecoverTokenData>, mut conn: DbConn) -> EmptyResult {
     let data: DeleteRecoverTokenData = data.into_inner();
 
     let Ok(claims) = decode_delete(&data.token) else {
         err!("Invalid claim")
     };
 
-    let Some(user) = User::find_by_uuid(&data.user_id, &conn).await else {
+    let Some(user) = User::find_by_uuid(&data.user_id, &mut conn).await else {
         err!("User doesn't exist")
     };
 
     if claims.sub != *user.uuid {
         err!("Invalid claim");
     }
-    user.delete(&conn).await
+    user.delete(&mut conn).await
 }
 
 #[post("/accounts/delete", data = "<data>")]
@@ -1123,13 +1029,13 @@ async fn post_delete_account(data: Json<PasswordOrOtpData>, headers: Headers, co
 }
 
 #[delete("/accounts", data = "<data>")]
-async fn delete_account(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn delete_account(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> EmptyResult {
     let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
-    data.validate(&user, true, &conn).await?;
+    data.validate(&user, true, &mut conn).await?;
 
-    user.delete(&conn).await
+    user.delete(&mut conn).await
 }
 
 #[get("/accounts/revision-date")]
@@ -1145,7 +1051,7 @@ struct PasswordHintData {
 }
 
 #[post("/accounts/password-hint", data = "<data>")]
-async fn password_hint(data: Json<PasswordHintData>, conn: DbConn) -> EmptyResult {
+async fn password_hint(data: Json<PasswordHintData>, mut conn: DbConn) -> EmptyResult {
     if !CONFIG.password_hints_allowed() || (!CONFIG.mail_enabled() && !CONFIG.show_password_hint()) {
         err!("This server is not configured to provide password hints.");
     }
@@ -1155,7 +1061,7 @@ async fn password_hint(data: Json<PasswordHintData>, conn: DbConn) -> EmptyResul
     let data: PasswordHintData = data.into_inner();
     let email = &data.email;
 
-    match User::find_by_mail(email, &conn).await {
+    match User::find_by_mail(email, &mut conn).await {
         None => {
             // To prevent user enumeration, act as if the user exists.
             if CONFIG.mail_enabled() {
@@ -1197,10 +1103,10 @@ async fn prelogin(data: Json<PreloginData>, conn: DbConn) -> Json<Value> {
     _prelogin(data, conn).await
 }
 
-pub async fn _prelogin(data: Json<PreloginData>, conn: DbConn) -> Json<Value> {
+pub async fn _prelogin(data: Json<PreloginData>, mut conn: DbConn) -> Json<Value> {
     let data: PreloginData = data.into_inner();
 
-    let (kdf_type, kdf_iter, kdf_mem, kdf_para) = match User::find_by_mail(&data.email, &conn).await {
+    let (kdf_type, kdf_iter, kdf_mem, kdf_para) = match User::find_by_mail(&data.email, &mut conn).await {
         Some(user) => (user.client_kdf_type, user.client_kdf_iter, user.client_kdf_memory, user.client_kdf_parallelism),
         None => (User::CLIENT_KDF_TYPE_DEFAULT, User::CLIENT_KDF_ITER_DEFAULT, None, None),
     };
@@ -1220,44 +1126,29 @@ struct SecretVerificationRequest {
     master_password_hash: String,
 }
 
-// Change the KDF Iterations if necessary
-pub async fn kdf_upgrade(user: &mut User, pwd_hash: &str, conn: &DbConn) -> ApiResult<()> {
-    if user.password_iterations < CONFIG.password_iterations() {
-        user.password_iterations = CONFIG.password_iterations();
-        user.set_password(pwd_hash, None, false, None);
-
-        if let Err(e) = user.save(conn).await {
-            error!("Error updating user: {e:#?}");
-        }
-    }
-    Ok(())
-}
-
 #[post("/accounts/verify-password", data = "<data>")]
 async fn verify_password(data: Json<SecretVerificationRequest>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: SecretVerificationRequest = data.into_inner();
-    let mut user = headers.user;
+    let user = headers.user;
 
     if !user.check_valid_password(&data.master_password_hash) {
         err!("Invalid password")
     }
 
-    kdf_upgrade(&mut user, &data.master_password_hash, &conn).await?;
-
     Ok(Json(master_password_policy(&user, &conn).await))
 }
 
-async fn _api_key(data: Json<PasswordOrOtpData>, rotate: bool, headers: Headers, conn: DbConn) -> JsonResult {
+async fn _api_key(data: Json<PasswordOrOtpData>, rotate: bool, headers: Headers, mut conn: DbConn) -> JsonResult {
     use crate::util::format_date;
 
     let data: PasswordOrOtpData = data.into_inner();
     let mut user = headers.user;
 
-    data.validate(&user, true, &conn).await?;
+    data.validate(&user, true, &mut conn).await?;
 
     if rotate || user.api_key.is_none() {
         user.api_key = Some(crypto::generate_api_key());
-        user.save(&conn).await.expect("Error saving API key");
+        user.save(&mut conn).await.expect("Error saving API key");
     }
 
     Ok(Json(json!({
@@ -1278,12 +1169,11 @@ async fn rotate_api_key(data: Json<PasswordOrOtpData>, headers: Headers, conn: D
 }
 
 #[get("/devices/knowndevice")]
-async fn get_known_device(device: KnownDevice, conn: DbConn) -> JsonResult {
-    let result = if let Some(user) = User::find_by_mail(&device.email, &conn).await {
-        Device::find_by_uuid_and_user(&device.uuid, &user.uuid, &conn).await.is_some()
-    } else {
-        false
-    };
+async fn get_known_device(device: KnownDevice, mut conn: DbConn) -> JsonResult {
+    let mut result = false;
+    if let Some(user) = User::find_by_mail(&device.email, &mut conn).await {
+        result = Device::find_by_uuid_and_user(&device.uuid, &user.uuid, &mut conn).await.is_some();
+    }
     Ok(Json(json!(result)))
 }
 
@@ -1325,8 +1215,8 @@ impl<'r> FromRequest<'r> for KnownDevice {
 }
 
 #[get("/devices")]
-async fn get_all_devices(headers: Headers, conn: DbConn) -> JsonResult {
-    let devices = Device::find_with_auth_request_by_user(&headers.user.uuid, &conn).await;
+async fn get_all_devices(headers: Headers, mut conn: DbConn) -> JsonResult {
+    let devices = Device::find_with_auth_request_by_user(&headers.user.uuid, &mut conn).await;
     let devices = devices.iter().map(|device| device.to_json()).collect::<Vec<Value>>();
 
     Ok(Json(json!({
@@ -1337,8 +1227,8 @@ async fn get_all_devices(headers: Headers, conn: DbConn) -> JsonResult {
 }
 
 #[get("/devices/identifier/<device_id>")]
-async fn get_device(device_id: DeviceId, headers: Headers, conn: DbConn) -> JsonResult {
-    let Some(device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &conn).await else {
+async fn get_device(device_id: DeviceId, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let Some(device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &mut conn).await else {
         err!("No device found");
     };
     Ok(Json(device.to_json()))
@@ -1356,11 +1246,17 @@ async fn post_device_token(device_id: DeviceId, data: Json<PushToken>, headers: 
 }
 
 #[put("/devices/identifier/<device_id>/token", data = "<data>")]
-async fn put_device_token(device_id: DeviceId, data: Json<PushToken>, headers: Headers, conn: DbConn) -> EmptyResult {
+async fn put_device_token(
+    device_id: DeviceId,
+    data: Json<PushToken>,
+    headers: Headers,
+    mut conn: DbConn,
+) -> EmptyResult {
     let data = data.into_inner();
     let token = data.push_token;
 
-    let Some(mut device) = Device::find_by_uuid_and_user(&headers.device.uuid, &headers.user.uuid, &conn).await else {
+    let Some(mut device) = Device::find_by_uuid_and_user(&headers.device.uuid, &headers.user.uuid, &mut conn).await
+    else {
         err!(format!("Error: device {device_id} should be present before a token can be assigned"))
     };
 
@@ -1373,17 +1269,17 @@ async fn put_device_token(device_id: DeviceId, data: Json<PushToken>, headers: H
     }
 
     device.push_token = Some(token);
-    if let Err(e) = device.save(&conn).await {
+    if let Err(e) = device.save(&mut conn).await {
         err!(format!("An error occurred while trying to save the device push token: {e}"));
     }
 
-    register_push_device(&mut device, &conn).await?;
+    register_push_device(&mut device, &mut conn).await?;
 
     Ok(())
 }
 
 #[put("/devices/identifier/<device_id>/clear-token")]
-async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
+async fn put_clear_device_token(device_id: DeviceId, mut conn: DbConn) -> EmptyResult {
     // This only clears push token
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/Controllers/DevicesController.cs#L215
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/Services/Implementations/DeviceService.cs#L37
@@ -1395,8 +1291,8 @@ async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResul
         return Ok(());
     }
 
-    if let Some(device) = Device::find_by_uuid(&device_id, &conn).await {
-        Device::clear_push_token_by_uuid(&device_id, &conn).await?;
+    if let Some(device) = Device::find_by_uuid(&device_id, &mut conn).await {
+        Device::clear_push_token_by_uuid(&device_id, &mut conn).await?;
         unregister_push_device(&device.push_uuid).await?;
     }
 
@@ -1425,17 +1321,17 @@ struct AuthRequestRequest {
 async fn post_auth_request(
     data: Json<AuthRequestRequest>,
     client_headers: ClientHeaders,
-    conn: DbConn,
+    mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
     let data = data.into_inner();
 
-    let Some(user) = User::find_by_mail(&data.email, &conn).await else {
+    let Some(user) = User::find_by_mail(&data.email, &mut conn).await else {
         err!("AuthRequest doesn't exist", "User not found")
     };
 
     // Validate device uuid and type
-    let device = match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &conn).await {
+    let device = match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &mut conn).await {
         Some(device) if device.atype == client_headers.device_type => device,
         _ => err!("AuthRequest doesn't exist", "Device verification failed"),
     };
@@ -1448,16 +1344,16 @@ async fn post_auth_request(
         data.access_code,
         data.public_key,
     );
-    auth_request.save(&conn).await?;
+    auth_request.save(&mut conn).await?;
 
-    nt.send_auth_request(&user.uuid, &auth_request.uuid, &device, &conn).await;
+    nt.send_auth_request(&user.uuid, &auth_request.uuid, &device, &mut conn).await;
 
     log_user_event(
         EventType::UserRequestedDeviceApproval as i32,
         &user.uuid,
         client_headers.device_type,
         &client_headers.ip.ip,
-        &conn,
+        &mut conn,
     )
     .await;
 
@@ -1477,8 +1373,8 @@ async fn post_auth_request(
 }
 
 #[get("/auth-requests/<auth_request_id>")]
-async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, conn: DbConn) -> JsonResult {
-    let Some(auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
+async fn get_auth_request(auth_request_id: AuthRequestId, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let Some(auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &mut conn).await
     else {
         err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
     };
@@ -1514,12 +1410,13 @@ async fn put_auth_request(
     auth_request_id: AuthRequestId,
     data: Json<AuthResponseRequest>,
     headers: Headers,
-    conn: DbConn,
+    mut conn: DbConn,
     ant: AnonymousNotify<'_>,
     nt: Notify<'_>,
 ) -> JsonResult {
     let data = data.into_inner();
-    let Some(mut auth_request) = AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &conn).await
+    let Some(mut auth_request) =
+        AuthRequest::find_by_uuid_and_user(&auth_request_id, &headers.user.uuid, &mut conn).await
     else {
         err!("AuthRequest doesn't exist", "Record not found or user uuid does not match")
     };
@@ -1541,28 +1438,28 @@ async fn put_auth_request(
         auth_request.master_password_hash = data.master_password_hash;
         auth_request.response_device_id = Some(data.device_identifier.clone());
         auth_request.response_date = Some(response_date);
-        auth_request.save(&conn).await?;
+        auth_request.save(&mut conn).await?;
 
         ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
-        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, &headers.device, &conn).await;
+        nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, &headers.device, &mut conn).await;
 
         log_user_event(
             EventType::OrganizationUserApprovedAuthRequest as i32,
             &headers.user.uuid,
             headers.device.atype,
             &headers.ip.ip,
-            &conn,
+            &mut conn,
         )
         .await;
     } else {
         // If denied, there's no reason to keep the request
-        auth_request.delete(&conn).await?;
+        auth_request.delete(&mut conn).await?;
         log_user_event(
             EventType::OrganizationUserRejectedAuthRequest as i32,
             &headers.user.uuid,
             headers.device.atype,
             &headers.ip.ip,
-            &conn,
+            &mut conn,
         )
         .await;
     }
@@ -1587,9 +1484,9 @@ async fn get_auth_request_response(
     auth_request_id: AuthRequestId,
     code: &str,
     client_headers: ClientHeaders,
-    conn: DbConn,
+    mut conn: DbConn,
 ) -> JsonResult {
-    let Some(auth_request) = AuthRequest::find_by_uuid(&auth_request_id, &conn).await else {
+    let Some(auth_request) = AuthRequest::find_by_uuid(&auth_request_id, &mut conn).await else {
         err!("AuthRequest doesn't exist", "User not found")
     };
 
@@ -1617,16 +1514,9 @@ async fn get_auth_request_response(
     })))
 }
 
-// Now unused but not yet removed
-// cf https://github.com/bitwarden/clients/blob/9b2fbdba1c028bf3394064609630d2ec224baefa/libs/common/src/services/api.service.ts#L245
 #[get("/auth-requests")]
-async fn get_auth_requests(headers: Headers, conn: DbConn) -> JsonResult {
-    get_auth_requests_pending(headers, conn).await
-}
-
-#[get("/auth-requests/pending")]
-async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult {
-    let auth_requests = AuthRequest::find_by_user(&headers.user.uuid, &conn).await;
+async fn get_auth_requests(headers: Headers, mut conn: DbConn) -> JsonResult {
+    let auth_requests = AuthRequest::find_by_user(&headers.user.uuid, &mut conn).await;
 
     Ok(Json(json!({
         "data": auth_requests
@@ -1656,8 +1546,8 @@ async fn get_auth_requests_pending(headers: Headers, conn: DbConn) -> JsonResult
 
 pub async fn purge_auth_requests(pool: DbPool) {
     debug!("Purging auth requests");
-    if let Ok(conn) = pool.get().await {
-        AuthRequest::purge_expired_auth_requests(&conn).await;
+    if let Ok(mut conn) = pool.get().await {
+        AuthRequest::purge_expired_auth_requests(&mut conn).await;
     } else {
         error!("Failed to get DB connection while purging trashed ciphers")
     }

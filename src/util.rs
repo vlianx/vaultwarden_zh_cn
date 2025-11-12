@@ -95,7 +95,6 @@ impl Fairing for AppHeaders {
                     manifest-src 'self'; \
                     base-uri 'self'; \
                     form-action 'self'; \
-                    media-src 'self'; \
                     object-src 'self' blob:; \
                     script-src 'self' 'wasm-unsafe-eval'; \
                     style-src 'self' 'unsafe-inline'; \
@@ -152,12 +151,9 @@ impl Cors {
     // If a match exists, return it. Otherwise, return None.
     fn get_allowed_origin(headers: &HeaderMap<'_>) -> Option<String> {
         let origin = Cors::get_header(headers, "Origin");
+        let domain_origin = CONFIG.domain_origin();
         let safari_extension_origin = "file://";
-
-        if origin == CONFIG.domain_origin()
-            || origin == safari_extension_origin
-            || (CONFIG.sso_enabled() && origin == CONFIG.sso_authority())
-        {
+        if origin == domain_origin || origin == safari_extension_origin {
             Some(origin)
         } else {
             None
@@ -842,7 +838,7 @@ pub fn is_global(ip: std::net::IpAddr) -> bool {
 
 /// Saves a Rocket temporary file to the OpenDAL Operator at the given path.
 pub async fn save_temp_file(
-    path_type: &PathType,
+    path_type: PathType,
     path: &str,
     temp_file: rocket::fs::TempFile<'_>,
     overwrite: bool,

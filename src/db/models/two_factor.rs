@@ -1,23 +1,20 @@
-use super::UserId;
-use crate::api::core::two_factor::webauthn::WebauthnRegistration;
-use crate::db::schema::twofactor;
-use crate::{api::EmptyResult, db::DbConn, error::MapResult};
-use diesel::prelude::*;
 use serde_json::Value;
-use webauthn_rs::prelude::{Credential, ParsedAttestation};
-use webauthn_rs_core::proto::CredentialV3;
-use webauthn_rs_proto::{AttestationFormat, RegisteredExtensions};
 
-#[derive(Identifiable, Queryable, Insertable, AsChangeset)]
-#[diesel(table_name = twofactor)]
-#[diesel(primary_key(uuid))]
-pub struct TwoFactor {
-    pub uuid: TwoFactorId,
-    pub user_uuid: UserId,
-    pub atype: i32,
-    pub enabled: bool,
-    pub data: String,
-    pub last_used: i64,
+use super::UserId;
+use crate::{api::EmptyResult, db::DbConn, error::MapResult};
+
+db_object! {
+    #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+    #[diesel(table_name = twofactor)]
+    #[diesel(primary_key(uuid))]
+    pub struct TwoFactor {
+        pub uuid: TwoFactorId,
+        pub user_uuid: UserId,
+        pub atype: i32,
+        pub enabled: bool,
+        pub data: String,
+        pub last_used: i64,
+    }
 }
 
 #[allow(dead_code)]
@@ -31,7 +28,6 @@ pub enum TwoFactorType {
     Remember = 5,
     OrganizationDuo = 6,
     Webauthn = 7,
-    RecoveryCode = 8,
 
     // These are implementation details
     U2fRegisterChallenge = 1000,
@@ -76,11 +72,11 @@ impl TwoFactor {
 
 /// Database methods
 impl TwoFactor {
-    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn:
             sqlite, mysql {
                 match diesel::replace_into(twofactor::table)
-                    .values(self)
+                    .values(TwoFactorDb::to_db(self))
                     .execute(conn)
                 {
                     Ok(_) => Ok(()),
@@ -88,7 +84,7 @@ impl TwoFactor {
                     Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
                         diesel::update(twofactor::table)
                             .filter(twofactor::uuid.eq(&self.uuid))
-                            .set(self)
+                            .set(TwoFactorDb::to_db(self))
                             .execute(conn)
                             .map_res("Error saving twofactor")
                     }
@@ -96,6 +92,7 @@ impl TwoFactor {
                 }.map_res("Error saving twofactor")
             }
             postgresql {
+                let value = TwoFactorDb::to_db(self);
                 // We need to make sure we're not going to violate the unique constraint on user_uuid and atype.
                 // This happens automatically on other DBMS backends due to replace_into(). PostgreSQL does
                 // not support multiple constraints on ON CONFLICT clauses.
@@ -104,17 +101,17 @@ impl TwoFactor {
                     .map_res("Error deleting twofactor for insert")?;
 
                 diesel::insert_into(twofactor::table)
-                    .values(self)
+                    .values(&value)
                     .on_conflict(twofactor::uuid)
                     .do_update()
-                    .set(self)
+                    .set(&value)
                     .execute(conn)
                     .map_res("Error saving twofactor")
             }
         }
     }
 
-    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(twofactor::table.filter(twofactor::uuid.eq(self.uuid)))
                 .execute(conn)
@@ -122,27 +119,29 @@ impl TwoFactor {
         }}
     }
 
-    pub async fn find_by_user(user_uuid: &UserId, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             twofactor::table
                 .filter(twofactor::user_uuid.eq(user_uuid))
                 .filter(twofactor::atype.lt(1000)) // Filter implementation types
-                .load::<Self>(conn)
+                .load::<TwoFactorDb>(conn)
                 .expect("Error loading twofactor")
+                .from_db()
         }}
     }
 
-    pub async fn find_by_user_and_type(user_uuid: &UserId, atype: i32, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_user_and_type(user_uuid: &UserId, atype: i32, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             twofactor::table
                 .filter(twofactor::user_uuid.eq(user_uuid))
                 .filter(twofactor::atype.eq(atype))
-                .first::<Self>(conn)
+                .first::<TwoFactorDb>(conn)
                 .ok()
+                .from_db()
         }}
     }
 
-    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(user_uuid)))
                 .execute(conn)
@@ -150,18 +149,18 @@ impl TwoFactor {
         }}
     }
 
-    pub async fn migrate_u2f_to_webauthn(conn: &DbConn) -> EmptyResult {
+    pub async fn migrate_u2f_to_webauthn(conn: &mut DbConn) -> EmptyResult {
         let u2f_factors = db_run! { conn: {
             twofactor::table
                 .filter(twofactor::atype.eq(TwoFactorType::U2f as i32))
-                .load::<Self>(conn)
+                .load::<TwoFactorDb>(conn)
                 .expect("Error loading twofactor")
+                .from_db()
         }};
 
         use crate::api::core::two_factor::webauthn::U2FRegistration;
         use crate::api::core::two_factor::webauthn::{get_webauthn_registrations, WebauthnRegistration};
-        use webauthn_rs::prelude::{COSEEC2Key, COSEKey, COSEKeyType, ECDSACurve};
-        use webauthn_rs_proto::{COSEAlgorithm, UserVerificationPolicy};
+        use webauthn_rs::proto::*;
 
         for mut u2f in u2f_factors {
             let mut regs: Vec<U2FRegistration> = serde_json::from_str(&u2f.data)?;
@@ -185,8 +184,8 @@ impl TwoFactor {
                     type_: COSEAlgorithm::ES256,
                     key: COSEKeyType::EC_EC2(COSEEC2Key {
                         curve: ECDSACurve::SECP256R1,
-                        x: x.into(),
-                        y: y.into(),
+                        x,
+                        y,
                     }),
                 };
 
@@ -196,19 +195,11 @@ impl TwoFactor {
                     name: reg.name.clone(),
                     credential: Credential {
                         counter: reg.counter,
-                        user_verified: false,
+                        verified: false,
                         cred: key,
-                        cred_id: reg.reg.key_handle.clone().into(),
-                        registration_policy: UserVerificationPolicy::Discouraged_DO_NOT_USE,
-
-                        transports: None,
-                        backup_eligible: false,
-                        backup_state: false,
-                        extensions: RegisteredExtensions::none(),
-                        attestation: ParsedAttestation::default(),
-                        attestation_format: AttestationFormat::None,
-                    }
-                    .into(),
+                        cred_id: reg.reg.key_handle.clone(),
+                        registration_policy: UserVerificationPolicy::Discouraged,
+                    },
                 };
 
                 webauthn_regs.push(new_reg);
@@ -226,51 +217,7 @@ impl TwoFactor {
 
         Ok(())
     }
-
-    pub async fn migrate_credential_to_passkey(conn: &DbConn) -> EmptyResult {
-        let webauthn_factors = db_run! { conn: {
-            twofactor::table
-                .filter(twofactor::atype.eq(TwoFactorType::Webauthn as i32))
-                .load::<Self>(conn)
-                .expect("Error loading twofactor")
-        }};
-
-        for webauthn_factor in webauthn_factors {
-            // assume that a failure to parse into the old struct, means that it was already converted
-            // alternatively this could also be checked via an extra field in the db
-            let Ok(regs) = serde_json::from_str::<Vec<WebauthnRegistrationV3>>(&webauthn_factor.data) else {
-                continue;
-            };
-
-            let regs = regs.into_iter().map(|r| r.into()).collect::<Vec<WebauthnRegistration>>();
-
-            TwoFactor::new(webauthn_factor.user_uuid.clone(), TwoFactorType::Webauthn, serde_json::to_string(&regs)?)
-                .save(conn)
-                .await?;
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, DieselNewType, FromForm, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TwoFactorId(String);
-
-#[derive(Deserialize)]
-pub struct WebauthnRegistrationV3 {
-    pub id: i32,
-    pub name: String,
-    pub migrated: bool,
-    pub credential: CredentialV3,
-}
-
-impl From<WebauthnRegistrationV3> for WebauthnRegistration {
-    fn from(value: WebauthnRegistrationV3) -> Self {
-        Self {
-            id: value.id,
-            name: value.name,
-            migrated: value.migrated,
-            credential: Credential::from(value.credential).into(),
-        }
-    }
-}

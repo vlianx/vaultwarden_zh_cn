@@ -1,24 +1,25 @@
-use bigdecimal::{BigDecimal, ToPrimitive};
-use derive_more::{AsRef, Deref, Display};
-use diesel::prelude::*;
-use serde_json::Value;
 use std::time::Duration;
 
+use bigdecimal::{BigDecimal, ToPrimitive};
+use derive_more::{AsRef, Deref, Display};
+use serde_json::Value;
+
 use super::{CipherId, OrganizationId, UserId};
-use crate::db::schema::{attachments, ciphers};
 use crate::{config::PathType, CONFIG};
 use macros::IdFromParam;
 
-#[derive(Identifiable, Queryable, Insertable, AsChangeset)]
-#[diesel(table_name = attachments)]
-#[diesel(treat_none_as_null = true)]
-#[diesel(primary_key(id))]
-pub struct Attachment {
-    pub id: AttachmentId,
-    pub cipher_uuid: CipherId,
-    pub file_name: String, // encrypted
-    pub file_size: i64,
-    pub akey: Option<String>,
+db_object! {
+    #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+    #[diesel(table_name = attachments)]
+    #[diesel(treat_none_as_null = true)]
+    #[diesel(primary_key(id))]
+    pub struct Attachment {
+        pub id: AttachmentId,
+        pub cipher_uuid: CipherId,
+        pub file_name: String, // encrypted
+        pub file_size: i64,
+        pub akey: Option<String>,
+    }
 }
 
 /// Local methods
@@ -44,7 +45,7 @@ impl Attachment {
     }
 
     pub async fn get_url(&self, host: &str) -> Result<String, crate::Error> {
-        let operator = CONFIG.opendal_operator_for_path_type(&PathType::Attachments)?;
+        let operator = CONFIG.opendal_operator_for_path_type(PathType::Attachments)?;
 
         if operator.info().scheme() == opendal::Scheme::Fs {
             let token = encode_jwt(&generate_file_download_claims(self.cipher_uuid.clone(), self.id.clone()));
@@ -75,11 +76,11 @@ use crate::error::MapResult;
 
 /// Database methods
 impl Attachment {
-    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn:
             sqlite, mysql {
                 match diesel::replace_into(attachments::table)
-                    .values(self)
+                    .values(AttachmentDb::to_db(self))
                     .execute(conn)
                 {
                     Ok(_) => Ok(()),
@@ -87,7 +88,7 @@ impl Attachment {
                     Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _)) => {
                         diesel::update(attachments::table)
                             .filter(attachments::id.eq(&self.id))
-                            .set(self)
+                            .set(AttachmentDb::to_db(self))
                             .execute(conn)
                             .map_res("Error saving attachment")
                     }
@@ -95,29 +96,29 @@ impl Attachment {
                 }.map_res("Error saving attachment")
             }
             postgresql {
+                let value = AttachmentDb::to_db(self);
                 diesel::insert_into(attachments::table)
-                    .values(self)
+                    .values(&value)
                     .on_conflict(attachments::id)
                     .do_update()
-                    .set(self)
+                    .set(&value)
                     .execute(conn)
                     .map_res("Error saving attachment")
             }
         }
     }
 
-    pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(&self, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
-            crate::util::retry(||
-                diesel::delete(attachments::table.filter(attachments::id.eq(&self.id)))
-                .execute(conn),
+            crate::util::retry(
+                || diesel::delete(attachments::table.filter(attachments::id.eq(&self.id))).execute(conn),
                 10,
             )
             .map(|_| ())
             .map_res("Error deleting attachment")
         }}?;
 
-        let operator = CONFIG.opendal_operator_for_path_type(&PathType::Attachments)?;
+        let operator = CONFIG.opendal_operator_for_path_type(PathType::Attachments)?;
         let file_path = self.get_file_path();
 
         if let Err(e) = operator.delete(&file_path).await {
@@ -131,32 +132,34 @@ impl Attachment {
         Ok(())
     }
 
-    pub async fn delete_all_by_cipher(cipher_uuid: &CipherId, conn: &DbConn) -> EmptyResult {
+    pub async fn delete_all_by_cipher(cipher_uuid: &CipherId, conn: &mut DbConn) -> EmptyResult {
         for attachment in Attachment::find_by_cipher(cipher_uuid, conn).await {
             attachment.delete(conn).await?;
         }
         Ok(())
     }
 
-    pub async fn find_by_id(id: &AttachmentId, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_id(id: &AttachmentId, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             attachments::table
                 .filter(attachments::id.eq(id.to_lowercase()))
-                .first::<Self>(conn)
+                .first::<AttachmentDb>(conn)
                 .ok()
+                .from_db()
         }}
     }
 
-    pub async fn find_by_cipher(cipher_uuid: &CipherId, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_cipher(cipher_uuid: &CipherId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             attachments::table
                 .filter(attachments::cipher_uuid.eq(cipher_uuid))
-                .load::<Self>(conn)
+                .load::<AttachmentDb>(conn)
                 .expect("Error loading attachments")
+                .from_db()
         }}
     }
 
-    pub async fn size_by_user(user_uuid: &UserId, conn: &DbConn) -> i64 {
+    pub async fn size_by_user(user_uuid: &UserId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
             let result: Option<BigDecimal> = attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
@@ -173,7 +176,7 @@ impl Attachment {
         }}
     }
 
-    pub async fn count_by_user(user_uuid: &UserId, conn: &DbConn) -> i64 {
+    pub async fn count_by_user(user_uuid: &UserId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
             attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
@@ -184,7 +187,7 @@ impl Attachment {
         }}
     }
 
-    pub async fn size_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> i64 {
+    pub async fn size_by_org(org_uuid: &OrganizationId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
             let result: Option<BigDecimal> = attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
@@ -201,7 +204,7 @@ impl Attachment {
         }}
     }
 
-    pub async fn count_by_org(org_uuid: &OrganizationId, conn: &DbConn) -> i64 {
+    pub async fn count_by_org(org_uuid: &OrganizationId, conn: &mut DbConn) -> i64 {
         db_run! { conn: {
             attachments::table
                 .left_join(ciphers::table.on(ciphers::uuid.eq(attachments::cipher_uuid)))
@@ -218,7 +221,7 @@ impl Attachment {
     pub async fn find_all_by_user_and_orgs(
         user_uuid: &UserId,
         org_uuids: &Vec<OrganizationId>,
-        conn: &DbConn,
+        conn: &mut DbConn,
     ) -> Vec<Self> {
         db_run! { conn: {
             attachments::table
@@ -226,8 +229,9 @@ impl Attachment {
                 .filter(ciphers::user_uuid.eq(user_uuid))
                 .or_filter(ciphers::organization_uuid.eq_any(org_uuids))
                 .select(attachments::all_columns)
-                .load::<Self>(conn)
+                .load::<AttachmentDb>(conn)
                 .expect("Error loading attachments")
+                .from_db()
         }}
     }
 }

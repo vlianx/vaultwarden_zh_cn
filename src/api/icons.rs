@@ -1,13 +1,13 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::{stream::StreamExt, TryFutureExt};
-use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{
     header::{self, HeaderMap, HeaderValue},
@@ -15,6 +15,8 @@ use reqwest::{
 };
 use rocket::{http::ContentType, response::Redirect, Route};
 use svg_hush::{data_url_filter, Filter};
+
+use html5gum::{Emitter, HtmlString, Readable, StringReader, Tokenizer};
 
 use crate::{
     config::PathType,
@@ -31,7 +33,7 @@ pub fn routes() -> Vec<Route> {
     }
 }
 
-static CLIENT: LazyLock<Client> = LazyLock::new(|| {
+static CLIENT: Lazy<Client> = Lazy::new(|| {
     // Generate the default headers
     let mut default_headers = HeaderMap::new();
     default_headers.insert(
@@ -76,7 +78,7 @@ static CLIENT: LazyLock<Client> = LazyLock::new(|| {
 });
 
 // Build Regex only once since this takes a lot of time.
-static ICON_SIZE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
+static ICON_SIZE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?x)(\d+)\D*(\d+)").unwrap());
 
 // The function name `icon_external` is checked in the `on_response` function in `AppHeaders`
 // It is used to prevent sending a specific header which breaks icon downloads.
@@ -218,7 +220,7 @@ async fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
     }
 
     // Try to read the cached icon, and return it if it exists
-    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
+    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(PathType::IconCache) {
         if let Ok(buf) = operator.read(path).await {
             return Some(buf.to_vec());
         }
@@ -228,7 +230,7 @@ async fn get_cached_icon(path: &str) -> Option<Vec<u8>> {
 }
 
 async fn file_is_expired(path: &str, ttl: u64) -> Result<bool, Error> {
-    let operator = CONFIG.opendal_operator_for_path_type(&PathType::IconCache)?;
+    let operator = CONFIG.opendal_operator_for_path_type(PathType::IconCache)?;
     let meta = operator.stat(path).await?;
     let modified =
         meta.last_modified().ok_or_else(|| std::io::Error::other(format!("No last modified time for `{path}`")))?;
@@ -244,7 +246,7 @@ async fn icon_is_negcached(path: &str) -> bool {
     match expired {
         // No longer negatively cached, drop the marker
         Ok(true) => {
-            match CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
+            match CONFIG.opendal_operator_for_path_type(PathType::IconCache) {
                 Ok(operator) => {
                     if let Err(e) = operator.delete(&miss_indicator).await {
                         error!("Could not remove negative cache indicator for icon {path:?}: {e:?}");
@@ -460,8 +462,8 @@ async fn get_page_with_referer(url: &str, referer: &str) -> Result<Response, Err
 /// priority2 = get_icon_priority("https://example.com/path/to/a/favicon.ico", "");
 /// ```
 fn get_icon_priority(href: &str, sizes: &str) -> u8 {
-    static PRIORITY_MAP: LazyLock<HashMap<&'static str, u8>> =
-        LazyLock::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
+    static PRIORITY_MAP: Lazy<HashMap<&'static str, u8>> =
+        Lazy::new(|| [(".png", 10), (".jpg", 20), (".jpeg", 20)].into_iter().collect());
 
     // Check if there is a dimension set
     let (width, height) = parse_sizes(sizes);
@@ -595,7 +597,7 @@ async fn download_icon(domain: &str) -> Result<(Bytes, Option<&str>), Error> {
 }
 
 async fn save_icon(path: &str, icon: Vec<u8>) {
-    let operator = match CONFIG.opendal_operator_for_path_type(&PathType::IconCache) {
+    let operator = match CONFIG.opendal_operator_for_path_type(PathType::IconCache) {
         Ok(operator) => operator,
         Err(e) => {
             warn!("Failed to get OpenDAL operator while saving icon: {e}");
@@ -639,9 +641,9 @@ async fn stream_to_bytes_limit(res: Response, max_size: usize) -> Result<Bytes, 
     let mut buf = BytesMut::new();
     let mut size = 0;
     while let Some(chunk) = stream.next().await {
-        // It is possible that there might occur UnexpectedEof errors or others
+        // It is possible that there might occure UnexpectedEof errors or others
         // This is most of the time no issue, and if there is no chunked data anymore or at all parsing the HTML will not happen anyway.
-        // Therefore if chunk is an err, just break and continue with the data be have received.
+        // Therfore if chunk is an err, just break and continue with the data be have received.
         if chunk.is_err() {
             break;
         }
