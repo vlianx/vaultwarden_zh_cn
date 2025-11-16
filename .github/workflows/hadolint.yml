@@ -1,12 +1,13 @@
 name: Hadolint
-
-on: [ push, pull_request ]
 permissions: {}
 
+on: [ push, pull_request ]
 
 jobs:
   hadolint:
     name: Validate Dockerfile syntax
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -30,11 +31,11 @@ jobs:
           sudo curl -L https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-$(uname -s)-$(uname -m) -o /usr/local/bin/hadolint && \
           sudo chmod +x /usr/local/bin/hadolint
         env:
-          HADOLINT_VERSION: 2.14.0
+          HADOLINT_VERSION: 2.12.0
       # End Download hadolint
       # Checkout the repo
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 #v4.2.2
         with:
           persist-credentials: false
       # End Checkout the repo

@@ -9,6 +9,8 @@ fn main() {
     println!("cargo:rustc-cfg=mysql");
     #[cfg(feature = "postgresql")]
     println!("cargo:rustc-cfg=postgresql");
+    #[cfg(feature = "query_logger")]
+    println!("cargo:rustc-cfg=query_logger");
     #[cfg(feature = "s3")]
     println!("cargo:rustc-cfg=s3");
 
@@ -22,6 +24,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(sqlite)");
     println!("cargo::rustc-check-cfg=cfg(mysql)");
     println!("cargo::rustc-check-cfg=cfg(postgresql)");
+    println!("cargo::rustc-check-cfg=cfg(query_logger)");
     println!("cargo::rustc-check-cfg=cfg(s3)");
 
     // Rerun when these paths are changed.
@@ -30,6 +33,9 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-changed=.git/refs/tags");
+
+    #[cfg(all(not(debug_assertions), feature = "query_logger"))]
+    compile_error!("Query Logging is only allowed during development, it is not intended for production usage!");
 
     // Support $BWRS_VERSION for legacy compatibility, but default to $VW_VERSION.
     // If neither exist, read from git.
