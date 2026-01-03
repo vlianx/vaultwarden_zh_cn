@@ -1,5 +1,28 @@
 ![Vaultwarden Logo](./resources/vaultwarden-logo-auto.svg)
 
+# vaultwarden-zhcn中文汉化文件内容
+
+## admin
+[dani-garcia/vaultwarden](https://github.com/dani-garcia/vaultwarden) 管理页面模板（位于 `src/static/templates/admin`）的简体中文翻译。
+## email
+[dani-garcia/vaultwarden](https://github.com/dani-garcia/vaultwarden) 电子邮件模板（位于 `src/static/templates/email`）的简体中文翻译。
+
+
+## 使用方法1
+保持文件结构，放置于 Vaultwarden 对应的目录下。
+
+例如 Docker 方式，假设你部署的时候使用 `-v` 参数指定的宿主机文件夹为 `vaultwarden-data`：
+
++ 管理页面模板文件放置于宿主机的 `/vaultwarden-data/templates/admin` 文件夹下
++ 电子邮件模板文件放置于宿主机的 `/vaultwarden-data/templates/email` 文件夹下
+
+然后 `docker restart vaultwarden` 重启 Vaultwarden 容器。
+## 使用方法2
+直接使用汉化镜像拉取
+```
+docker pull registry.cn-hangzhou.aliyuncs.com/docker609/vaultwarden:latest
+```
+
 An alternative server implementation of the Bitwarden Client API, written in Rust and compatible with [official Bitwarden clients](https://bitwarden.com/download/) [[disclaimer](#disclaimer)], perfect for self-hosted deployment where running the official resource-heavy service might not be ideal.
 
 ---
@@ -59,20 +82,18 @@ A nearly complete implementation of the Bitwarden Client API is provided, includ
 ## Usage
 
 > [!IMPORTANT]
-> The web-vault requires the use a secure context for the [Web Crypto API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Crypto_API).
-> That means it will only work via `http://localhost:8000` (using the port from the example below) or if you [enable HTTPS](https://github.com/dani-garcia/vaultwarden/wiki/Enabling-HTTPS).
-
-The recommended way to install and use Vaultwarden is via our container images which are published to [ghcr.io](https://github.com/dani-garcia/vaultwarden/pkgs/container/vaultwarden), [docker.io](https://hub.docker.com/r/vaultwarden/server) and [quay.io](https://quay.io/repository/vaultwarden/server).
-See [which container image to use](https://github.com/dani-garcia/vaultwarden/wiki/Which-container-image-to-use) for an explanation of the provided tags.
-
-There are also [community driven packages](https://github.com/dani-garcia/vaultwarden/wiki/Third-party-packages) which can be used, but those might be lagging behind the latest version or might deviate in the way Vaultwarden is configured, as described in our [Wiki](https://github.com/dani-garcia/vaultwarden/wiki).
-
-Alternatively, you can also [build Vaultwarden](https://github.com/dani-garcia/vaultwarden/wiki/Building-binary) yourself.
-
-While Vaultwarden is based upon the [Rocket web framework](https://rocket.rs) which has built-in support for TLS our recommendation would be that you setup a reverse proxy (see [proxy examples](https://github.com/dani-garcia/vaultwarden/wiki/Proxy-examples)).
+> Most modern web browsers disallow the use of Web Crypto APIs in insecure contexts. In this case, you might get an error like `Cannot read property 'importKey'`. To solve this problem, you need to access the web vault via HTTPS or localhost.
+>
+>This can be configured in [Vaultwarden directly](https://github.com/dani-garcia/vaultwarden/wiki/Enabling-HTTPS) or using a third-party reverse proxy ([some examples](https://github.com/dani-garcia/vaultwarden/wiki/Proxy-examples)).
+>
+>If you have an available domain name, you can get HTTPS certificates with [Let's Encrypt](https://letsencrypt.org/), or you can generate self-signed certificates with utilities like [mkcert](https://github.com/FiloSottile/mkcert). Some proxies automatically do this step, like Caddy or Traefik (see examples linked above).
 
 > [!TIP]
 >**For more detailed examples on how to install, use and configure Vaultwarden you can check our [Wiki](https://github.com/dani-garcia/vaultwarden/wiki).**
+
+The main way to use Vaultwarden is via our container images which are published to [ghcr.io](https://github.com/dani-garcia/vaultwarden/pkgs/container/vaultwarden), [docker.io](https://hub.docker.com/r/vaultwarden/server) and [quay.io](https://quay.io/repository/vaultwarden/server).
+
+There are also [community driven packages](https://github.com/dani-garcia/vaultwarden/wiki/Third-party-packages) which can be used, but those might be lagging behind the latest version or might deviate in the way Vaultwarden is configured, as described in our [Wiki](https://github.com/dani-garcia/vaultwarden/wiki).
 
 ### Docker/Podman CLI
 
@@ -85,7 +106,7 @@ docker run --detach --name vaultwarden \
   --env DOMAIN="https://vw.domain.tld" \
   --volume /vw-data/:/data/ \
   --restart unless-stopped \
-  --publish 127.0.0.1:8000:80 \
+  --publish 80:80 \
   vaultwarden/server:latest
 ```
 
@@ -106,7 +127,7 @@ services:
     volumes:
       - ./vw-data/:/data/
     ports:
-      - 127.0.0.1:8000:80
+      - 80:80
 ```
 
 <br>
